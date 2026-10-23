@@ -108,6 +108,10 @@ pub struct Stats {
     pub items: AtomicU64,
     pub downloaded: AtomicU64,
     pub bytes: AtomicU64,
+    /// Size of the whole drive online (its root folder), for overall progress.
+    pub drive_bytes: AtomicU64,
+    /// Size of the files already synced when the pass started.
+    pub synced_bytes_at_start: AtomicU64,
     pub unchanged: AtomicU64,
     pub dirs_created: AtomicU64,
     pub deleted: AtomicU64,

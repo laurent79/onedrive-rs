@@ -145,3 +145,22 @@ msgstr "Ajouter"
 
 msgid "No site found"
 msgstr "Aucun site trouvé"
+
+msgid "{} of {} GB ({}%)"
+msgstr "{} sur {} Go ({} %)"
+
+msgid "{} MB/s"
+msgstr "{} Mo/s"
+
+msgid "less than a minute left"
+msgstr "moins d'une minute restante"
+
+msgid "about {n} minute left"
+msgid_plural "about {n} minutes left"
+msgstr[0] "environ {n} minute restante"
+msgstr[1] "environ {n} minutes restantes"
+
+msgid "about {n} hour left"
+msgid_plural "about {n} hours left"
+msgstr[0] "environ {n} heure restante"
+msgstr[1] "environ {n} heures restantes"

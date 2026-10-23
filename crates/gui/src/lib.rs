@@ -2,8 +2,9 @@
 //! a SharePoint library, and a tray icon (StatusNotifierItem), all driven over
 //! D-Bus by the daemon. The UI never performs sync I/O itself.
 
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use odrs_ipc::{Client, DriveStatus, Snapshot};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
@@ -218,6 +219,7 @@ async fn poll(
         }
     };
     let mut last: Option<Snapshot> = None;
+    let mut rates = Rates::default();
     let mut tick = tokio::time::interval(REFRESH);
     loop {
         tokio::select! {
@@ -235,7 +237,8 @@ async fn poll(
             }
         };
         let status = to_status(snapshot.as_ref());
-        let rows: Vec<DriveRow> = snapshot.as_ref().map(|s| s.drives.iter().map(to_row).collect()).unwrap_or_default();
+        let rows: Vec<DriveRow> =
+            snapshot.as_ref().map(|s| s.drives.iter().map(|d| to_row(d, rates.sample(d))).collect()).unwrap_or_default();
         last = snapshot;
         let s = status.clone();
         let _ = window.upgrade_in_event_loop(move |w| {
@@ -357,9 +360,56 @@ fn sync_rows(model: &VecModel<DriveRow>, rows: Vec<DriveRow>) {
     }
 }
 
-fn to_row(d: &DriveStatus) -> DriveRow {
+/// Download rate per drive, measured over a sliding window so that pauses
+/// imposed by SharePoint throttling do not make the estimate jump around.
+#[derive(Default)]
+struct Rates {
+    samples: HashMap<String, VecDeque<(Instant, u64)>>,
+}
+
+const RATE_WINDOW: Duration = Duration::from_secs(30);
+
+impl Rates {
+    /// Bytes per second for this drive, if measurable.
+    fn sample(&mut self, d: &DriveStatus) -> Option<f64> {
+        let now = Instant::now();
+        let q = self.samples.entry(d.name.clone()).or_default();
+        let bytes = d.progress.synced_bytes;
+        if d.state != "syncing" || q.back().is_some_and(|&(_, b)| b > bytes) {
+            // Not syncing, or a new pass started: start measuring again.
+            q.clear();
+        }
+        if d.state != "syncing" {
+            return None;
+        }
+        q.push_back((now, bytes));
+        while q.front().is_some_and(|&(t, _)| now - t > RATE_WINDOW) {
+            q.pop_front();
+        }
+        let &(t0, b0) = q.front()?;
+        let dt = (now - t0).as_secs_f64();
+        (dt >= 5.0).then(|| (bytes - b0) as f64 / dt)
+    }
+}
+
+fn to_row(d: &DriveStatus, rate: Option<f64>) -> DriveRow {
     let int = |v: u64| i32::try_from(v).unwrap_or(i32::MAX);
+    let gb = |v: u64| (v as f64 / 1e9) as f32;
+    let p = &d.progress;
+    let remaining = p.drive_bytes.saturating_sub(p.synced_bytes);
+    // Only worth a bar when a noticeable part of the drive is still missing.
+    let show_progress = d.state == "syncing" && p.drive_bytes > 0 && remaining > p.drive_bytes / 1000;
+    let eta = match rate {
+        Some(r) if r > 1.0 => i32::try_from((remaining as f64 / r / 60.0) as i64).unwrap_or(i32::MAX),
+        _ => -1,
+    };
     DriveRow {
+        show_progress,
+        fraction: if p.drive_bytes > 0 { (p.synced_bytes as f64 / p.drive_bytes as f64) as f32 } else { 0.0 },
+        synced_gb: gb(p.synced_bytes),
+        total_gb: gb(p.drive_bytes),
+        rate_mbs: rate.map_or(-1.0, |r| (r / 1e6) as f32),
+        eta_mins: eta,
         title: if d.name == "main" { "OneDrive".into() } else { d.name.as_str().into() },
         removable: d.name != "main",
         name: d.name.as_str().into(),

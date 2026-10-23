@@ -76,6 +76,9 @@ impl<'a> DownloadSync<'a> {
         if self.store.get(&root_drive, &root_item.id)?.is_none() {
             self.store.upsert(&root_item)?;
         }
+        // Overall progress: what is already synced versus the size of the whole drive.
+        self.stats.drive_bytes.store(root.size.unwrap_or(0).max(0) as u64, Ordering::Relaxed);
+        self.stats.synced_bytes_at_start.store(self.store.file_bytes(&root_drive)?, Ordering::Relaxed);
         tracing::info!(drive = %drive.id, root = %root_item.id, sync_dir = %self.opts.sync_dir.display(), "applying online changes");
 
         let mut url = match self.store.delta_link(&root_drive, &root_item.id)? {

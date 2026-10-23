@@ -52,6 +52,10 @@ pub struct Progress {
     pub errors: u64,
     pub uploaded: u64,
     pub deleted_online: u64,
+    /// Size of the whole drive online, 0 if unknown.
+    pub drive_bytes: u64,
+    /// Bytes synced locally so far (at most `drive_bytes`).
+    pub synced_bytes: u64,
 }
 
 /// State of one synchronised drive, in the `Drives` property.

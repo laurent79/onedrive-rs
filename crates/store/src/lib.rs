@@ -350,6 +350,16 @@ impl Store {
         Ok(())
     }
 
+    /// Total size of the files recorded for a drive (what is synced locally).
+    pub fn file_bytes(&self, drive_id: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(CAST(size AS INTEGER)), 0) FROM item WHERE driveId = ?1 AND type = 'file'",
+            params![drive_id],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
     pub fn count_by_type(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare("SELECT type, count(*) FROM item GROUP BY type ORDER BY type")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;

@@ -298,6 +298,8 @@ fn add(total: &mut Progress, p: &Progress) {
     total.errors += p.errors;
     total.uploaded += p.uploaded;
     total.deleted_online += p.deleted_online;
+    total.drive_bytes += p.drive_bytes;
+    total.synced_bytes += p.synced_bytes;
 }
 
 /// Next local change, or never when not watching.
@@ -333,6 +335,8 @@ fn progress(s: &Stats) -> Progress {
         uploaded: g(&s.uploaded),
         deleted_online: g(&s.deleted_online),
         errors: g(&s.errors),
+        drive_bytes: g(&s.drive_bytes),
+        synced_bytes: (g(&s.synced_bytes_at_start) + g(&s.bytes)).min(g(&s.drive_bytes)),
     }
 }
 
