@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OneDrive
+GenericName=OneDrive client
+Comment=Synchronise files with Microsoft OneDrive
+Comment[fr]=Synchroniser les fichiers avec Microsoft OneDrive
+Exec=onedrive-rs gui
+Icon=io.github.onedrive_rs
+Categories=Network;FileTransfer;
+StartupNotify=false

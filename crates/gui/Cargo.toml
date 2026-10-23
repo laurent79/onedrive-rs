@@ -1,0 +1,16 @@
+[package]
+name = "odrs-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+odrs-ipc = { version = "0.1.0", path = "../ipc" }
+slint = { version = "1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2", "system-tray"] }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["parsing"] }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
+tracing = "0.1.44"
+
+[build-dependencies]
+slint-build = "1.18.1"

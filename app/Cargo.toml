@@ -12,6 +12,7 @@ odrs-graph = { version = "0.1.0", path = "../crates/graph" }
 odrs-store = { version = "0.1.0", path = "../crates/store" }
 odrs-quickxor = { version = "0.1.0", path = "../crates/quickxor" }
 odrs-ipc = { version = "0.1.0", path = "../crates/ipc" }
+odrs-gui = { version = "0.1.0", path = "../crates/gui" }
 time = "0.3.55"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1.44"

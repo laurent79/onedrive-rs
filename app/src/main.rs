@@ -83,8 +83,12 @@ enum Command {
     Pause,
     /// Resume the running daemon.
     Resume,
-    /// Open the graphical interface (not implemented yet).
-    Gui,
+    /// Open the status window and tray icon (talks to the daemon over D-Bus).
+    Gui {
+        /// Start with only the tray icon.
+        #[arg(long)]
+        hidden: bool,
+    },
 }
 
 struct Paths {
@@ -114,8 +118,7 @@ fn default_sync_dir() -> Result<PathBuf> {
     Ok(dirs::home_dir().context("no home directory")?.join("OneDrive-rs"))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let level = match cli.verbose {
         0 => "info",
@@ -132,7 +135,34 @@ async fn main() -> Result<()> {
 
     let paths = Paths::new(cli.config_dir)?;
     let auth = AuthConfig { client_id: cli.client_id, read_only: false };
-    match cli.command {
+    let rt = tokio::runtime::Runtime::new()?;
+    if let Command::Gui { hidden } = cli.command {
+        // The UI event loop owns this thread; async D-Bus work runs on the runtime's workers.
+        let opts = odrs_gui::Options { hidden, start_daemon: Box::new(spawn_daemon) };
+        return Ok(odrs_gui::run(rt.handle().clone(), opts)?);
+    }
+    rt.block_on(run(cli.command, paths, auth))
+}
+
+/// Start `onedrive-rs daemon` detached from the GUI, logging to the XDG state dir.
+fn spawn_daemon() -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let log_dir = dirs::state_dir().unwrap_or_else(std::env::temp_dir).join("onedrive-rs");
+    std::fs::create_dir_all(&log_dir)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("daemon.log"))?;
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("daemon")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .spawn()?;
+    Ok(())
+}
+
+async fn run(command: Command, paths: Paths, auth: AuthConfig) -> Result<()> {
+    match command {
         Command::Login { manual, read_only } => login(&paths, AuthConfig { read_only, ..auth }, manual).await,
         Command::Sync { download_only, sync_dir, transfers } => {
             if !download_only {
@@ -160,15 +190,18 @@ async fn main() -> Result<()> {
             daemon::run(&paths, auth, sync_dir, transfers, Duration::from_secs(interval)).await
         }
         Command::SyncNow | Command::Pause | Command::Resume => {
-            let proxy = odrs_ipc::connect().await?.context("the daemon is not running")?;
-            match cli.command {
-                Command::SyncNow => proxy.sync_now().await?,
-                Command::Pause => proxy.pause().await?,
-                _ => proxy.resume().await?,
+            let client = odrs_ipc::Client::new().await?;
+            if !client.is_running().await? {
+                bail!("the daemon is not running");
+            }
+            match command {
+                Command::SyncNow => client.daemon().sync_now().await?,
+                Command::Pause => client.daemon().pause().await?,
+                _ => client.daemon().resume().await?,
             }
             Ok(())
         }
-        Command::Gui => bail!("not implemented yet"),
+        Command::Gui { .. } => unreachable!("handled in main"),
     }
 }
 
@@ -262,21 +295,20 @@ fn print_stats(s: &Stats, started: Instant, label: &str) {
 async fn status(paths: &Paths, auth: AuthConfig) -> Result<()> {
     println!("Config dir: {}", paths.config_dir.display());
     // While the daemon runs it owns the tokens: ask it instead of refreshing them here.
-    let daemon = match odrs_ipc::connect().await {
-        Ok(d) => d,
+    let snapshot = match odrs_ipc::Client::new().await {
+        Ok(c) => c.snapshot().await?,
         Err(e) => {
             tracing::debug!(error = %e, "no session bus");
             None
         }
     };
-    if let Some(d) = daemon {
-        let p = d.progress().await?;
-        println!("Daemon:     {} (sync dir {})", d.state().await?, d.sync_dir().await?);
-        println!("Account:    {}", d.account().await?);
-        println!("Last sync:  {}", Some(d.last_sync().await?).filter(|s| !s.is_empty()).unwrap_or_else(|| "never".into()));
-        let err = d.last_error().await?;
-        if !err.is_empty() {
-            println!("Last error: {err}");
+    if let Some(d) = snapshot {
+        let p = d.progress;
+        println!("Daemon:     {} (sync dir {})", d.state, d.sync_dir);
+        println!("Account:    {}", d.account);
+        println!("Last sync:  {}", if d.last_sync.is_empty() { "never" } else { &d.last_sync });
+        if !d.last_error.is_empty() {
+            println!("Last error: {}", d.last_error);
         }
         println!(
             "Last pass:  {} items, {} downloaded ({:.1} MiB), {} unchanged, {} deleted, {} skipped, {} errors",

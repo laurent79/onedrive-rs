@@ -1,0 +1,171 @@
+import { Button, GroupBox, Spinner, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+
+// Everything the UI shows, pushed from Rust once per second.
+export struct Status {
+    // "idle" | "syncing" | "paused" | "error" | "stopped" (daemon not running)
+    state: string,
+    account: string,
+    sync-dir: string,
+    last-error: string,
+    // Minutes since the last successful pass, -1 if never.
+    last-sync-mins: int,
+    items: int,
+    downloaded: int,
+    gib: float,
+    unchanged: int,
+    skipped: int,
+    errors: int,
+}
+
+export global Logic {
+    callback sync-now();
+    callback toggle-pause();
+    callback open-folder();
+    callback start-daemon();
+    callback show-window();
+    callback quit();
+}
+
+component StateIcon inherits Image {
+    in property <string> state;
+    source: state == "idle" ? @image-url("../icons/idle.png")
+        : state == "syncing" ? @image-url("../icons/syncing.png")
+        : state == "paused" ? @image-url("../icons/paused.png")
+        : state == "error" ? @image-url("../icons/error.png")
+        : @image-url("../icons/stopped.png");
+}
+
+global Fmt {
+    public pure function state-label(state: string) -> string {
+        if state == "idle" { return @tr("Up to date"); }
+        if state == "syncing" { return @tr("Synchronising…"); }
+        if state == "paused" { return @tr("Paused"); }
+        if state == "error" { return @tr("Error"); }
+        return @tr("Service not running");
+    }
+
+    public pure function last-sync-label(mins: int) -> string {
+        if mins < 0 { return @tr("never"); }
+        if mins < 1 { return @tr("just now"); }
+        if mins < 120 { return @tr("{n} minute ago" | "{n} minutes ago" % mins); }
+        return @tr("{n} hour ago" | "{n} hours ago" % floor(mins / 60));
+    }
+}
+
+component Row inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: 12px;
+    Text { text: label; color: Palette.foreground.transparentize(40%); min-width: 140px; }
+    Text { text: value; horizontal-stretch: 1; overflow: elide; }
+}
+
+export component MainWindow inherits Window {
+    in property <Status> status;
+    title: "OneDrive";
+    icon: @image-url("../icons/app.png");
+    preferred-width: 460px;
+    min-width: 380px;
+    // The window is not resized when sections appear: size it for the largest state.
+    min-height: 380px;
+
+    VerticalBox {
+        HorizontalBox {
+            padding: 0;
+            StateIcon { state: status.state; width: 48px; height: 48px; }
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Text { text: Fmt.state-label(status.state); font-size: 18px; font-weight: 600; }
+                    if status.state == "syncing": Spinner { indeterminate: true; width: 18px; height: 18px; }
+                }
+                Text { text: status.account; color: Palette.foreground.transparentize(40%); overflow: elide; }
+            }
+        }
+
+        if status.state != "stopped": GroupBox {
+            title: status.state == "syncing" ? @tr("Current pass") : @tr("Last pass");
+            VerticalLayout {
+                spacing: 4px;
+                Row { label: @tr("Folder"); value: status.sync-dir; }
+                Row { label: @tr("Last success"); value: Fmt.last-sync-label(status.last-sync-mins); }
+                Row { label: @tr("Items checked"); value: status.items; }
+                Row { label: @tr("Downloaded"); value: @tr("{} files ({} GiB)", status.downloaded, round(status.gib * 10) / 10); }
+                Row { label: @tr("Unchanged"); value: status.unchanged; }
+                Row { label: @tr("Skipped"); value: status.skipped; }
+                Row { label: @tr("Errors"); value: status.errors; }
+            }
+        }
+
+        if status.last-error != "": Text {
+            text: status.last-error;
+            color: #c62828;
+            wrap: word-wrap;
+        }
+
+        if status.state == "stopped": Text {
+            text: @tr("The onedrive-rs background service is not running. Start it to keep your files in sync.");
+            wrap: word-wrap;
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        HorizontalBox {
+            padding: 0;
+            alignment: end;
+            if status.state == "stopped": Button {
+                text: @tr("Start service");
+                primary: true;
+                clicked => { Logic.start-daemon(); }
+            }
+            if status.state != "stopped": Button {
+                text: @tr("Sync now");
+                enabled: status.state == "idle" || status.state == "error";
+                clicked => { Logic.sync-now(); }
+            }
+            if status.state != "stopped": Button {
+                text: status.state == "paused" ? @tr("Resume") : @tr("Pause");
+                clicked => { Logic.toggle-pause(); }
+            }
+            Button {
+                text: @tr("Open folder");
+                enabled: status.sync-dir != "";
+                clicked => { Logic.open-folder(); }
+            }
+        }
+    }
+}
+
+export component Tray inherits SystemTrayIcon {
+    in property <Status> status;
+    icon: status.state == "idle" ? @image-url("../icons/idle.png")
+        : status.state == "syncing" ? @image-url("../icons/syncing.png")
+        : status.state == "paused" ? @image-url("../icons/paused.png")
+        : status.state == "error" ? @image-url("../icons/error.png")
+        : @image-url("../icons/stopped.png");
+    title: "OneDrive";
+    tooltip: "OneDrive — " + Fmt.state-label(status.state);
+    clicked => { Logic.show-window(); }
+
+    Menu {
+        MenuItem { title: Fmt.state-label(status.state); enabled: false; }
+        MenuItem { title: @tr("Show window"); activated => { Logic.show-window(); } }
+        MenuSeparator { }
+        MenuItem {
+            title: @tr("Sync now");
+            enabled: status.state == "idle" || status.state == "error";
+            activated => { Logic.sync-now(); }
+        }
+        MenuItem {
+            title: status.state == "paused" ? @tr("Resume") : @tr("Pause");
+            enabled: status.state != "stopped";
+            activated => { Logic.toggle-pause(); }
+        }
+        MenuItem { title: @tr("Open folder"); enabled: status.sync-dir != ""; activated => { Logic.open-folder(); } }
+        MenuSeparator { }
+        MenuItem { title: @tr("Quit"); activated => { Logic.quit(); } }
+    }
+}

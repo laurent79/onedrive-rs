@@ -216,13 +216,61 @@ pub trait OneDrive {
     fn progress(&self) -> zbus::Result<Progress>;
 }
 
-/// Connect to a running daemon, or `Ok(None)` if none owns [`BUS_NAME`].
-pub async fn connect() -> Result<Option<OneDriveProxy<'static>>> {
-    let conn = zbus::Connection::session().await?;
-    let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
-    if !dbus.name_has_owner(BUS_NAME.try_into()?).await? {
-        return Ok(None);
+/// Everything a client displays, read in one `GetAll` call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub state: String,
+    pub last_sync: String,
+    pub last_error: String,
+    pub account: String,
+    pub sync_dir: String,
+    pub progress: Progress,
+}
+
+/// Session-bus client usable whether or not the daemon is running (it may
+/// start or stop at any time).
+#[derive(Clone)]
+pub struct Client {
+    dbus: zbus::fdo::DBusProxy<'static>,
+    props: zbus::fdo::PropertiesProxy<'static>,
+    proxy: OneDriveProxy<'static>,
+}
+
+impl Client {
+    pub async fn new() -> Result<Self> {
+        let conn = zbus::Connection::session().await?;
+        let dbus = zbus::fdo::DBusProxy::new(&conn).await?;
+        let props = zbus::fdo::PropertiesProxy::builder(&conn)
+            .destination(BUS_NAME)?
+            .path(OBJECT_PATH)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?;
+        let proxy = OneDriveProxy::builder(&conn).cache_properties(zbus::proxy::CacheProperties::No).build().await?;
+        Ok(Self { dbus, props, proxy })
     }
-    Ok(Some(OneDriveProxy::new(&conn).await?))
+
+    pub async fn is_running(&self) -> Result<bool> {
+        Ok(self.dbus.name_has_owner(BUS_NAME.try_into()?).await?)
+    }
+
+    /// Current daemon state, or `None` if the daemon is not running.
+    pub async fn snapshot(&self) -> Result<Option<Snapshot>> {
+        if !self.is_running().await? {
+            return Ok(None);
+        }
+        let iface = zbus::names::InterfaceName::from_static_str_unchecked(BUS_NAME);
+        let mut all = self.props.get_all(iface).await?;
+        let mut text = |k: &str| all.remove(k).and_then(|v| String::try_from(v).ok()).unwrap_or_default();
+        let (state, last_sync, last_error, account, sync_dir) =
+            (text("State"), text("LastSync"), text("LastError"), text("Account"), text("SyncDir"));
+        let progress = all.remove("Progress").and_then(|v| Progress::try_from(v).ok()).unwrap_or_default();
+        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress }))
+    }
+
+    /// Method calls (`sync_now`, `pause`, `resume`).
+    pub fn daemon(&self) -> &OneDriveProxy<'static> {
+        &self.proxy
+    }
 }
 
