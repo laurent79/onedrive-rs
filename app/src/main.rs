@@ -208,9 +208,15 @@ fn main() -> Result<()> {
     rt.block_on(run(cli.command, paths, cfg, auth))
 }
 
-/// Start `onedrive-rs daemon` detached from the GUI, logging to the XDG state dir.
+/// Start the daemon for the GUI: through systemd when the user unit is installed
+/// (contrib/install.sh), otherwise detached, logging to the XDG state dir.
 fn spawn_daemon() -> std::io::Result<()> {
     use std::os::unix::process::CommandExt as _;
+    let unit = dirs::config_dir().map(|d| d.join("systemd/user/onedrive-rs.service"));
+    if unit.is_some_and(|u| u.exists()) {
+        let status = std::process::Command::new("systemctl").args(["--user", "start", "onedrive-rs.service"]).status()?;
+        return if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("systemctl failed: {status}"))) };
+    }
     let log_dir = dirs::state_dir().unwrap_or_else(std::env::temp_dir).join("onedrive-rs");
     std::fs::create_dir_all(&log_dir)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("daemon.log"))?;

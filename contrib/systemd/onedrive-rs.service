@@ -1,15 +1,12 @@
-# User service for onedrive-rs.
-#   cargo install --path app
-#   cp contrib/systemd/onedrive-rs.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload && systemctl --user enable --now onedrive-rs
+# User service for onedrive-rs, installed by contrib/install.sh.
+#   systemctl --user enable --now onedrive-rs
 [Unit]
 Description=OneDrive client (onedrive-rs)
-Documentation=https://github.com/abraunegg/onedrive
 
 [Service]
 Type=dbus
 BusName=io.github.onedrive_rs.OneDrive1
-ExecStart=%h/.cargo/bin/onedrive-rs daemon
+ExecStart=%h/.local/bin/onedrive-rs daemon
 Restart=on-failure
 RestartSec=30
 
