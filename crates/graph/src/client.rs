@@ -178,6 +178,11 @@ impl Graph {
         self.get_json(&format!("{GRAPH_BASE}/me/drive")).await
     }
 
+    /// Any drive by id, e.g. a SharePoint document library.
+    pub async fn drive(&self, drive_id: &str) -> Result<Drive> {
+        self.get_json(&format!("{GRAPH_BASE}/drives/{drive_id}")).await
+    }
+
     pub async fn drive_root(&self, drive_id: &str) -> Result<DriveItem> {
         self.get_json(&format!("{GRAPH_BASE}/drives/{drive_id}/root")).await
     }

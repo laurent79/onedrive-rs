@@ -147,6 +147,35 @@ impl Store {
         Self::open(dest)
     }
 
+    /// Copy the rows of drive `drive_id` from another item database (a D client
+    /// instance dedicated to that drive) into this one, replacing any rows this
+    /// database already has for it. Returns the number of rows copied. Fails if
+    /// `src` is locked by a running D client or has another schema version.
+    pub fn merge_drive(&self, src: &Path, drive_id: &str) -> Result<u64> {
+        let source = Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i32 = source.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(Error::SchemaVersion(version));
+        }
+        drop(source);
+        let uri = format!("file:{}?mode=ro", src.display());
+        self.conn.execute("ATTACH DATABASE ?1 AS src", params![uri])?;
+        let result = (|| {
+            let tx = self.conn.unchecked_transaction()?;
+            // Rows arrive in any order: check parent references at commit time.
+            tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+            tx.execute("DELETE FROM item WHERE driveId = ?1", params![drive_id])?;
+            let n = tx.execute(
+                &format!("INSERT INTO item ({COLUMNS}, deltaLink) SELECT {COLUMNS}, deltaLink FROM src.item WHERE driveId = ?1"),
+                params![drive_id],
+            )?;
+            tx.commit()?;
+            Ok::<_, rusqlite::Error>(n as u64)
+        })();
+        self.conn.execute_batch("DETACH DATABASE src")?;
+        Ok(result?)
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -418,6 +447,31 @@ mod tests {
         drop(s);
         let imported = Store::import(&src, &dest).unwrap();
         assert_eq!(imported.delta_link("D", "R").unwrap().as_deref(), Some("cursor"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merge_drive_keeps_other_drives() {
+        let dir = std::env::temp_dir().join(format!("odrs-merge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src_path = dir.join("library.sqlite3");
+        let src = Store::open(&src_path).unwrap();
+        let lib = |id: &str, t, parent: Option<&str>| Item { drive_id: "L".into(), ..item(id, id, t, parent) };
+        // Children before parents, as rows may come in any order.
+        src.conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        src.upsert(&lib("F", ItemType::File, Some("A"))).unwrap();
+        src.upsert(&lib("A", ItemType::Dir, Some("LR"))).unwrap();
+        src.upsert(&lib("LR", ItemType::Root, None)).unwrap();
+        src.set_delta_link("L", "LR", Some("cursor")).unwrap();
+        drop(src);
+
+        let ours = Store::open_in_memory().unwrap();
+        ours.upsert(&item("R", "root", ItemType::Root, None)).unwrap();
+        assert_eq!(ours.merge_drive(&src_path, "L").unwrap(), 3);
+        assert_eq!(ours.merge_drive(&src_path, "L").unwrap(), 3, "replaces, does not duplicate");
+        assert_eq!(ours.path_of("L", "F").unwrap().as_deref(), Some("A/F"));
+        assert_eq!(ours.delta_link("L", "LR").unwrap().as_deref(), Some("cursor"));
+        assert!(ours.root("D").unwrap().is_some(), "main drive untouched");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

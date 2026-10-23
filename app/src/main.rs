@@ -76,14 +76,19 @@ enum Command {
         interval: Option<u64>,
     },
     /// Take over a D client installation (database, sync cursor and sync folder)
-    /// without downloading anything again. Stop the D client first.
+    /// without downloading anything again. Stop the D client first. A D
+    /// configuration with a drive_id (SharePoint library) is added as a [drive].
     ImportD {
         /// D client configuration directory.
         #[arg(long, default_value = "~/.config/onedrive")]
         from: String,
-        /// Replace an existing onedrive-rs database (kept as a .bak file).
+        /// Main account: replace an existing onedrive-rs database (kept as a .bak file).
+        /// Library: import it again over the existing rows.
         #[arg(long)]
         force: bool,
+        /// Name of the [drive] section for a SharePoint library (default: folder name).
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Ask the running daemon to sync now.
     SyncNow,
@@ -111,20 +116,51 @@ struct SyncArgs {
     /// Maximum concurrent transfers [config: threads; default 8].
     #[arg(long)]
     transfers: Option<usize>,
+    /// Only these drives: `main` (the account's OneDrive) or a [drive "name"] from the config. Repeatable.
+    #[arg(long = "drive", value_name = "NAME")]
+    drives: Vec<String>,
+}
+
+/// One drive to synchronise and its folder.
+pub struct Target {
+    pub name: String,
+    pub opts: SyncOptions,
 }
 
 impl SyncArgs {
-    fn resolve(self, cfg: &config::Config) -> Result<(SyncOptions, odrs_engine::SyncMode)> {
-        let sync_dir = match self.sync_dir.or_else(|| cfg.sync_dir.clone()) {
+    /// The account's own OneDrive (`main`), then the configured libraries.
+    fn resolve(self, cfg: &config::Config) -> Result<(Vec<Target>, odrs_engine::SyncMode)> {
+        let main_dir = match self.sync_dir.or_else(|| cfg.sync_dir.clone()) {
             Some(d) => d,
             None => default_sync_dir()?,
         };
-        let mut opts = cfg.sync_options(sync_dir);
-        if let Some(t) = self.transfers {
-            opts.max_transfers = t;
+        let mut targets = vec![Target { name: "main".into(), opts: cfg.sync_options(main_dir) }];
+        for d in &cfg.drives {
+            let mut opts = cfg.sync_options(d.sync_dir.clone());
+            opts.drive_id = Some(d.drive_id.clone());
+            targets.push(Target { name: d.name.clone(), opts });
+        }
+        // Folders must not overlap: one tree would be synced (and deleted) twice.
+        for (i, a) in targets.iter().enumerate() {
+            for b in &targets[i + 1..] {
+                if a.opts.sync_dir.starts_with(&b.opts.sync_dir) || b.opts.sync_dir.starts_with(&a.opts.sync_dir) {
+                    bail!("sync folders of \"{}\" and \"{}\" overlap", a.name, b.name);
+                }
+            }
+        }
+        if !self.drives.is_empty() {
+            if let Some(unknown) = self.drives.iter().find(|n| !targets.iter().any(|t| t.name.eq_ignore_ascii_case(n))) {
+                bail!("unknown drive \"{unknown}\" (known: {})", targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            targets.retain(|t| self.drives.iter().any(|n| t.name.eq_ignore_ascii_case(n)));
+        }
+        for t in &mut targets {
+            if let Some(n) = self.transfers {
+                t.opts.max_transfers = n;
+            }
         }
         let mode = self.mode.unwrap_or(if cfg.download_only == Some(true) { Mode::DownloadOnly } else { Mode::Bidirectional });
-        Ok((opts, mode.into()))
+        Ok((targets, mode.into()))
     }
 }
 
@@ -238,9 +274,11 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             if download_only {
                 args.mode = Some(Mode::DownloadOnly);
             }
-            let (mut opts, mode) = args.resolve(&cfg)?;
-            opts.dry_run = dry_run;
-            sync(&paths, auth, opts, mode).await
+            let (mut targets, mode) = args.resolve(&cfg)?;
+            for t in &mut targets {
+                t.opts.dry_run = dry_run;
+            }
+            sync(&paths, auth, targets, mode).await
         }
         Command::Status => status(&paths, auth).await,
         Command::Verify { db, dir, limit } => {
@@ -251,11 +289,11 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             verify(&db.unwrap_or_else(|| paths.db()), &dir, limit)
         }
         Command::Daemon { args, interval } => {
-            let (opts, mode) = args.resolve(&cfg)?;
+            let (targets, mode) = args.resolve(&cfg)?;
             let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
-            daemon::run(&paths, auth, opts, mode, interval).await
+            daemon::run(&paths, auth, targets, mode, interval).await
         }
-        Command::ImportD { from, force } => import::run(&paths, auth, config::expand_home(&from), force).await,
+        Command::ImportD { from, force, name } => import::run(&paths, auth, config::expand_home(&from), name, force).await,
         Command::SyncNow | Command::Pause | Command::Resume => {
             let client = odrs_ipc::Client::new().await?;
             if !client.is_running().await? {
@@ -315,10 +353,34 @@ fn lock(paths: &Paths) -> Result<std::fs::File> {
     }
 }
 
-async fn sync(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: odrs_engine::SyncMode) -> Result<()> {
+async fn sync(paths: &Paths, auth: AuthConfig, targets: Vec<Target>, mode: odrs_engine::SyncMode) -> Result<()> {
     let _lock = lock(paths)?;
     let graph = Arc::new(Graph::new(odrs_graph::http_client()?, auth, paths.token_store())?);
     let store = Store::open(&paths.db())?;
+    let mut failed = Vec::new();
+    for t in targets {
+        tracing::info!(drive = %t.name, sync_dir = %t.opts.sync_dir.display(), "syncing");
+        match sync_one(&graph, &store, t.opts, mode).await {
+            Ok(()) => {}
+            Err(e) if e.is::<Interrupted>() => return Err(e),
+            Err(e) => {
+                tracing::error!(drive = %t.name, error = %e, "sync failed");
+                failed.push(t.name);
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("sync failed for: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("interrupted")]
+struct Interrupted;
+
+async fn sync_one(graph: &Arc<Graph>, store: &Store, opts: SyncOptions, mode: odrs_engine::SyncMode) -> Result<()> {
+    let graph = graph.clone();
     let stats = Arc::new(Stats::default());
     let started = Instant::now();
     let progress = tokio::spawn({
@@ -333,8 +395,8 @@ async fn sync(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: odrs_eng
         }
     });
     let result = tokio::select! {
-        r = odrs_engine::sync(graph, &store, opts, stats.clone(), mode) => r.map_err(anyhow::Error::from),
-        _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
+        r = odrs_engine::sync(graph, store, opts, stats.clone(), mode) => r.map_err(anyhow::Error::from),
+        _ = tokio::signal::ctrl_c() => Err(Interrupted.into()),
     };
     progress.abort();
     print_stats(&stats, started, "done");

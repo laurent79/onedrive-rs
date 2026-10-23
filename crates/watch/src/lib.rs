@@ -20,10 +20,9 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Watch `root` recursively. A message is sent on the returned channel for
-    /// every relevant change; callers debounce.
-    pub fn new(root: &Path, relevant: Filter) -> Result<(Self, mpsc::UnboundedReceiver<PathBuf>), Error> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Watch `root` recursively. The path of every relevant change is sent on
+    /// `tx` (several watchers may share one channel); callers debounce.
+    pub fn new(root: &Path, relevant: Filter, tx: mpsc::UnboundedSender<PathBuf>) -> Result<Self, Error> {
         let mut inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(event) => {
                 if matches!(event.kind, EventKind::Access(_)) {
@@ -36,7 +35,7 @@ impl Watcher {
             Err(e) => tracing::warn!(error = %e, "file watcher error"),
         })?;
         inner.watch(root, RecursiveMode::Recursive)?;
-        Ok((Self { _inner: inner }, rx))
+        Ok(Self { _inner: inner })
     }
 }
 
@@ -51,7 +50,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let filter: Filter = Box::new(|p| p.extension().is_none_or(|e| e != "partial"));
-        let (_w, mut rx) = Watcher::new(&root, filter).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _w = Watcher::new(&root, filter, tx).unwrap();
 
         std::fs::write(root.join("x.partial"), b"ignored").unwrap();
         std::fs::create_dir(root.join("sub")).unwrap();

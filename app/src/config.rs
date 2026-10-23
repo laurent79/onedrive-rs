@@ -1,6 +1,16 @@
 //! `~/.config/onedrive-rs/config`, in the D client's format: one
 //! `key = "value"` per line, `#` comments; `skip_file`/`skip_dir` may repeat.
 //! Command-line options override the file.
+//!
+//! Top-level keys describe the account's own OneDrive. Other drives
+//! (SharePoint document libraries) are added as sections, all synced by the
+//! same daemon with the same login and filters:
+//!
+//! ```text
+//! [drive "Engineering"]
+//! drive_id = "b!8mPT…"
+//! sync_dir = "~/SharePoint/Engineering"
+//! ```
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +29,17 @@ pub struct Config {
     pub classify_as_big_delete: Option<u64>,
     pub sync_dir_permissions: Option<u32>,
     pub sync_file_permissions: Option<u32>,
+    /// Only in a D client configuration dedicated to one SharePoint library.
+    pub drive_id: Option<String>,
+    /// Additional drives (`[drive "name"]` sections).
+    pub drives: Vec<DriveConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveConfig {
+    pub name: String,
+    pub drive_id: String,
+    pub sync_dir: PathBuf,
 }
 
 impl Config {
@@ -33,9 +54,39 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let mut c = Self::default();
+        // Current [drive "name"] section: (name, drive_id, sync_dir, header line).
+        let mut section: Option<(String, Option<String>, Option<PathBuf>, usize)> = None;
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                if let Some(s) = section.take() {
+                    c.drives.push(finish_section(s)?);
+                }
+                let name = header
+                    .trim()
+                    .strip_prefix("drive")
+                    .map(str::trim)
+                    .and_then(|n| n.strip_prefix('"'))
+                    .and_then(|n| n.strip_suffix('"'))
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("line {}: expected [drive \"name\"]", n + 1))?;
+                section = Some((name.to_owned(), None, None, n + 1));
+                continue;
+            }
+            if let Some((_, drive_id, sync_dir, _)) = section.as_mut() {
+                let Some((key, value)) = line.split_once('=') else {
+                    bail!("line {}: expected `key = \"value\"`", n + 1);
+                };
+                let value = value.trim();
+                let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
+                match key.trim() {
+                    "drive_id" => *drive_id = Some(value.to_owned()),
+                    "sync_dir" => *sync_dir = Some(expand_home(value)),
+                    other => bail!("line {}: `{other}` is not supported in a [drive] section", n + 1),
+                }
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -58,8 +109,17 @@ impl Config {
                 // Octal digits written as a decimal number, as in the D client ("700").
                 "sync_dir_permissions" => c.sync_dir_permissions = Some(octal(value, line_no)?),
                 "sync_file_permissions" => c.sync_file_permissions = Some(octal(value, line_no)?),
+                // Used by the D client for a SharePoint-only configuration (see `import-d`).
+                "drive_id" => c.drive_id = Some(value.to_owned()),
                 other => tracing::warn!(key = other, line = line_no, "unsupported config option ignored"),
             }
+        }
+        if let Some(s) = section.take() {
+            c.drives.push(finish_section(s)?);
+        }
+        let mut names = std::collections::HashSet::new();
+        if let Some(d) = c.drives.iter().find(|d| !names.insert(d.name.to_lowercase()) || d.name.eq_ignore_ascii_case("main")) {
+            bail!("drive name \"{}\" is used twice (\"main\" is the account's own OneDrive)", d.name);
         }
         Ok(c)
     }
@@ -88,6 +148,13 @@ impl Config {
             o.file_mode = m;
         }
         o
+    }
+}
+
+fn finish_section((name, drive_id, sync_dir, line): (String, Option<String>, Option<PathBuf>, usize)) -> Result<DriveConfig> {
+    match (drive_id, sync_dir) {
+        (Some(drive_id), Some(sync_dir)) => Ok(DriveConfig { name, drive_id, sync_dir }),
+        _ => bail!("line {line}: [drive \"{name}\"] needs both drive_id and sync_dir"),
     }
 }
 
@@ -124,6 +191,29 @@ pub fn expand_home(p: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_sections() {
+        let c = Config::parse(
+            r#"
+            sync_dir = "~/OneDrive"
+            [drive "Engineering"]
+            drive_id = "b!abc"
+            sync_dir = "~/SharePoint/Engineering"
+            [drive "Sales"]
+            sync_dir = "/srv/sales"
+            drive_id = "b!def"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.drives.len(), 2);
+        assert_eq!(c.drives[1], DriveConfig { name: "Sales".into(), drive_id: "b!def".into(), sync_dir: "/srv/sales".into() });
+        assert!(c.sync_dir.unwrap().ends_with("OneDrive"));
+        assert!(Config::parse("[drive \"X\"]\ndrive_id = \"a\"").is_err(), "missing sync_dir");
+        assert!(Config::parse("[drive \"X\"]\ndrive_id = \"a\"\nsync_dir = \"/a\"\nthreads = \"2\"").is_err());
+        assert!(Config::parse("[drive \"main\"]\ndrive_id = \"a\"\nsync_dir = \"/a\"").is_err());
+        assert!(Config::parse("[drives]").is_err());
+    }
 
     #[test]
     fn parses_d_style_config() {

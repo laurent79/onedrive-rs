@@ -22,11 +22,21 @@ pub fn decide_without_hash(prev: Option<&Item>, new: &Item, local: LocalState, n
         LocalState::Dir | LocalState::Other => Some(FileAction::Blocked),
         LocalState::File { size, mtime } => {
             let same_meta = Some(size as i64) == new.size && mtime == new_mtime;
-            // Online content unchanged since we recorded it and the local file still
-            // looks exactly as we left it: trust it.
             let unchanged_online = prev.is_some_and(|p| {
                 p.quick_xor_hash.is_some() && p.quick_xor_hash == new.quick_xor_hash && p.size == new.size
             });
+            // D's isItemSynced: a local file still carrying the mtime recorded at the
+            // last sync is that synced version, whatever its size (SharePoint may have
+            // enriched the online copy of an uploaded Office file).
+            if let Some(p) = prev
+                && crate::convert::parse_graph_time(&p.mtime).is_some_and(|t| t.unix_timestamp() == mtime)
+            {
+                return Some(if unchanged_online {
+                    FileAction::Record { fix_mtime: mtime != new_mtime }
+                } else {
+                    FileAction::Download { backup: false }
+                });
+            }
             if same_meta && (unchanged_online || new.quick_xor_hash.is_none()) {
                 return Some(FileAction::Record { fix_mtime: false });
             }
@@ -89,7 +99,9 @@ pub enum LocalChange {
 /// Cheap check (D's `isItemSynced`: whole-second mtime first). `None` means
 /// the local file must be hashed.
 pub fn local_change_without_hash(db: &Item, size: u64, mtime: i64, db_mtime: i64) -> Option<LocalChange> {
-    if mtime == db_mtime && Some(size as i64) == db.size {
+    // Same whole-second mtime as recorded: in sync, as in the D client, even if the
+    // size differs (online copy enriched by SharePoint after upload).
+    if mtime == db_mtime {
         return Some(LocalChange::Unchanged);
     }
     if db.quick_xor_hash.is_none() || Some(size as i64) != db.size {
@@ -147,7 +159,14 @@ mod tests {
         assert_eq!(decide_without_hash(Some(&file(Some("h"), 3)), &new, local, T), Some(FileAction::Record { fix_mtime: false }));
         // Unknown to the DB, or content changed online: must hash.
         assert_eq!(decide_without_hash(None, &new, local, T), None);
-        assert_eq!(decide_without_hash(Some(&file(Some("old"), 3)), &new, local, T), None);
+        // Local file untouched since the last sync (recorded mtime), online changed: replace, no backup.
+        assert_eq!(decide_without_hash(Some(&file(Some("old"), 3)), &new, local, T), Some(FileAction::Download { backup: false }));
+        // Same, with an enriched online size the local copy never had.
+        let enriched = file(Some("h"), 9);
+        assert_eq!(
+            decide_without_hash(Some(&enriched), &file(Some("h"), 9), local, T),
+            Some(FileAction::Record { fix_mtime: false })
+        );
         // Local mtime changed: must hash.
         assert_eq!(decide_without_hash(Some(&file(Some("h"), 3)), &new, LocalState::File { size: 3, mtime: T + 1 }, T), None);
     }
@@ -167,6 +186,7 @@ mod tests {
     fn local_changes() {
         let db = file(Some("h"), 3);
         assert_eq!(local_change_without_hash(&db, 3, T, T), Some(LocalChange::Unchanged));
+        assert_eq!(local_change_without_hash(&db, 7, T, T), Some(LocalChange::Unchanged), "enriched online");
         assert_eq!(local_change_without_hash(&db, 4, T + 1, T), Some(LocalChange::Modified));
         assert_eq!(local_change_without_hash(&db, 3, T + 1, T), None);
         assert_eq!(local_change_with_hash(&db, "h"), LocalChange::MtimeOnly);

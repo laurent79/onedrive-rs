@@ -75,6 +75,8 @@ pub struct SyncOptions {
     pub dir_mode: u32,
     /// Mode of files downloaded (D: `sync_file_permissions`, default 600).
     pub file_mode: u32,
+    /// Drive to sync (e.g. a SharePoint document library); `None` = the account's own OneDrive.
+    pub drive_id: Option<String>,
 }
 
 impl SyncOptions {
@@ -88,6 +90,7 @@ impl SyncOptions {
             dry_run: false,
             dir_mode: 0o700,
             file_mode: 0o600,
+            drive_id: None,
         }
     }
 }
@@ -121,6 +124,13 @@ pub struct Stats {
     pub conflicts: AtomicU64,
 }
 
+pub(crate) async fn resolve_drive(graph: &Graph, opts: &SyncOptions) -> Result<odrs_graph::Drive, Error> {
+    Ok(match &opts.drive_id {
+        Some(id) => graph.drive(id).await?,
+        None => graph.me_drive().await?,
+    })
+}
+
 /// Run one pass: apply pending online changes (`/delta`) locally, then, in
 /// bidirectional mode, push local changes online (D's default remote-first order).
 ///
@@ -128,7 +138,7 @@ pub struct Stats {
 /// side is compared with the database and reported.
 pub async fn sync(graph: Arc<Graph>, store: &Store, opts: SyncOptions, stats: Arc<Stats>, mode: SyncMode) -> Result<(), Error> {
     let drive_id = if opts.dry_run {
-        let drive = graph.me_drive().await?;
+        let drive = resolve_drive(&graph, &opts).await?;
         match store.root(&drive.id)? {
             Some(root) => root.drive_id,
             None => drive.id,

@@ -64,8 +64,11 @@ impl<'a> DownloadSync<'a> {
     pub async fn run(mut self) -> Result<String, Error> {
         self.store.abort_open_transaction()?;
         local::create_dir_all(&self.opts.sync_dir, self.opts.dir_mode)?;
-        let drive = self.graph.me_drive().await?;
-        self.graph.set_prefer_add_to_onedrive(drive.is_personal());
+        let drive = crate::resolve_drive(&self.graph, &self.opts).await?;
+        if self.opts.drive_id.is_none() {
+            // Only the account's own drive decides (a library is never "personal").
+            self.graph.set_prefer_add_to_onedrive(drive.is_personal());
+        }
         self.drive_id = drive.id.clone();
         let root = self.graph.drive_root(&drive.id).await?;
         let root_item = to_db_item(&root, &drive.id)?;
