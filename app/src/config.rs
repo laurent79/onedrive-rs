@@ -151,6 +151,67 @@ impl Config {
     }
 }
 
+/// Checks before adding a drive: unique name and drive, folder not overlapping
+/// any configured one (including the main `sync_dir`, `main_dir`).
+pub fn validate_new_drive(cfg: &Config, main_dir: &Path, name: &str, drive_id: &str, sync_dir: &Path) -> Result<()> {
+    if name.trim().is_empty() || name.contains(['"', '[', ']', '\n']) {
+        bail!("invalid drive name \"{name}\"");
+    }
+    if name.eq_ignore_ascii_case("main") || cfg.drives.iter().any(|d| d.name.eq_ignore_ascii_case(name)) {
+        bail!("a drive named \"{name}\" already exists");
+    }
+    if let Some(d) = cfg.drives.iter().find(|d| d.drive_id == drive_id) {
+        bail!("this library is already synced as \"{}\"", d.name);
+    }
+    if !sync_dir.is_absolute() {
+        bail!("the folder must be an absolute path");
+    }
+    let dirs = std::iter::once(main_dir).chain(cfg.drives.iter().map(|d| d.sync_dir.as_path()));
+    if let Some(other) = dirs.into_iter().find(|d| d.starts_with(sync_dir) || sync_dir.starts_with(d)) {
+        bail!("{} overlaps {}", sync_dir.display(), other.display());
+    }
+    Ok(())
+}
+
+/// Append a `[drive]` section to the config file.
+pub fn append_drive_section(path: &Path, d: &DriveConfig) -> Result<()> {
+    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("\n[drive \"{}\"]\ndrive_id = \"{}\"\nsync_dir = \"{}\"\n", d.name, d.drive_id, d.sync_dir.display()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// Remove the `[drive "name"]` section (header and its keys) from the config file.
+pub fn remove_drive_section(path: &Path, name: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let header = |l: &str| {
+        let l = l.trim();
+        l.starts_with('[') && l.ends_with(']')
+    };
+    let target = format!("[drive \"{name}\"]");
+    let mut skipping = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if header(line) {
+            skipping = line.trim() == target;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    std::fs::write(path, out.join("\n") + "\n")?;
+    Ok(())
+}
+
 fn finish_section((name, drive_id, sync_dir, line): (String, Option<String>, Option<PathBuf>, usize)) -> Result<DriveConfig> {
     match (drive_id, sync_dir) {
         (Some(drive_id), Some(sync_dir)) => Ok(DriveConfig { name, drive_id, sync_dir }),
@@ -213,6 +274,28 @@ mod tests {
         assert!(Config::parse("[drive \"X\"]\ndrive_id = \"a\"\nsync_dir = \"/a\"\nthreads = \"2\"").is_err());
         assert!(Config::parse("[drive \"main\"]\ndrive_id = \"a\"\nsync_dir = \"/a\"").is_err());
         assert!(Config::parse("[drives]").is_err());
+    }
+
+    #[test]
+    fn add_and_remove_sections() {
+        let p = std::env::temp_dir().join(format!("odrs-sections-test-{}", std::process::id()));
+        std::fs::write(&p, "sync_dir = \"/home/u/OneDrive\"\n").unwrap();
+        let d = DriveConfig { name: "Engineering".into(), drive_id: "b!a".into(), sync_dir: "/home/u/SharePoint/Engineering".into() };
+        append_drive_section(&p, &d).unwrap();
+        append_drive_section(&p, &DriveConfig { name: "Sales".into(), drive_id: "b!b".into(), sync_dir: "/v".into() }).unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.drives.len(), 2);
+        let main = Path::new("/home/u/OneDrive");
+        assert!(validate_new_drive(&c, main, "engineering", "b!z", Path::new("/x")).is_err(), "name taken");
+        assert!(validate_new_drive(&c, main, "X", "b!a", Path::new("/x")).is_err(), "drive taken");
+        assert!(validate_new_drive(&c, main, "X", "b!z", Path::new("/home/u/OneDrive/sub")).is_err(), "overlap");
+        assert!(validate_new_drive(&c, main, "X", "b!z", Path::new("relative")).is_err());
+        assert!(validate_new_drive(&c, main, "X", "b!z", Path::new("/home/u/SharePoint/X")).is_ok());
+        remove_drive_section(&p, "Engineering").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.drives.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Sales"]);
+        assert!(c.sync_dir.is_some());
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]

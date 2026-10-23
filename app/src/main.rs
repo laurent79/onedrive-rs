@@ -122,6 +122,7 @@ struct SyncArgs {
 }
 
 /// One drive to synchronise and its folder.
+#[derive(Clone)]
 pub struct Target {
     pub name: String,
     pub opts: SyncOptions,
@@ -291,7 +292,7 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
         Command::Daemon { args, interval } => {
             let (targets, mode) = args.resolve(&cfg)?;
             let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
-            daemon::run(&paths, auth, targets, mode, interval).await
+            daemon::run(&paths, auth, cfg.clone(), targets, mode, interval).await
         }
         Command::ImportD { from, force, name } => import::run(&paths, auth, config::expand_home(&from), name, force).await,
         Command::SyncNow | Command::Pause | Command::Resume => {

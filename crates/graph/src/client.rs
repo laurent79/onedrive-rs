@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::{self, AuthConfig, TokenStore, Tokens};
 use crate::error::{Error, Result};
-use crate::types::{DELTA_SELECT, DeltaPage, Drive, DriveItem};
+use crate::types::{DELTA_SELECT, DeltaPage, Drive, DriveItem, DriveListing, Page, SiteResource};
 
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const USER_AGENT: &str = concat!("ISV|onedrive-rs|onedrive-rs/", env!("CARGO_PKG_VERSION"));
@@ -181,6 +181,31 @@ impl Graph {
     /// Any drive by id, e.g. a SharePoint document library.
     pub async fn drive(&self, drive_id: &str) -> Result<Drive> {
         self.get_json(&format!("{GRAPH_BASE}/drives/{drive_id}")).await
+    }
+
+    /// SharePoint sites the account can see, matching `query` (`*` for all).
+    pub async fn search_sites(&self, query: &str) -> Result<Vec<SiteResource>> {
+        let q: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+        self.collect_pages(format!("{GRAPH_BASE}/sites?search={q}&$select=id,displayName,name,webUrl")).await
+    }
+
+    /// Document libraries of a site.
+    pub async fn site_drives(&self, site_id: &str) -> Result<Vec<DriveListing>> {
+        self.collect_pages(format!("{GRAPH_BASE}/sites/{site_id}/drives?$select=id,name,driveType,webUrl")).await
+    }
+
+    /// Follow `@odata.nextLink` (bounded: these lists are for humans to pick from).
+    async fn collect_pages<T: DeserializeOwned>(&self, mut url: String) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            let page: Page<T> = self.get_json(&url).await?;
+            out.extend(page.value);
+            match page.next_link {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     pub async fn drive_root(&self, drive_id: &str) -> Result<DriveItem> {

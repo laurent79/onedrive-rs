@@ -156,6 +156,34 @@ pub struct Quota {
     pub remaining: Option<i64>,
 }
 
+/// A SharePoint site (`/sites?search=`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteResource {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub name: Option<String>,
+    pub web_url: Option<String>,
+}
+
+/// A drive as listed by `/sites/{id}/drives`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveListing {
+    pub id: String,
+    pub name: Option<String>,
+    pub drive_type: Option<String>,
+    pub web_url: Option<String>,
+}
+
+/// A page of an OData collection.
+#[derive(Debug, Deserialize)]
+pub struct Page<T> {
+    pub value: Vec<T>,
+    #[serde(rename = "@odata.nextLink")]
+    pub next_link: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

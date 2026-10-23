@@ -1,29 +1,38 @@
-//! `onedrive-rs daemon`: periodic sync passes, controlled over D-Bus.
+//! `onedrive-rs daemon`: periodic sync passes over every configured drive,
+//! controlled over D-Bus.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use odrs_engine::{Stats, SyncMode};
 use odrs_graph::{AuthConfig, Graph};
-use odrs_ipc::{Command, Info, Progress, Server, State};
+use odrs_ipc::{AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State};
 use odrs_store::Store;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
+use crate::config::{self, Config, DriveConfig};
 use crate::{Paths, Target};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 /// Retry delay after a pass failed for lack of network.
 const OFFLINE_RETRY: Duration = Duration::from_secs(60);
-/// Prefix of `LastError` when the login expired (see `odrs_ipc::AUTH_ERROR_PREFIX`).
-use odrs_ipc::AUTH_ERROR_PREFIX;
 /// Quiet time after a local change before starting a pass.
 const DEBOUNCE: Duration = Duration::from_secs(5);
 
-pub async fn run(paths: &Paths, auth: AuthConfig, targets: Vec<Target>, mode: SyncMode, interval: Duration) -> Result<()> {
+/// Drive list shared between the sync loop and D-Bus drive management.
+struct Drives {
+    targets: Vec<Target>,
+    /// Drive ids removed since the last pass: their database rows are dropped.
+    removed: Vec<String>,
+    /// Bumped on every change, so the loop knows to rebuild its watchers.
+    version: u64,
+}
+
+pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Target>, mode: SyncMode, interval: Duration) -> Result<()> {
     let _lock = crate::lock(paths)?;
     let graph = Arc::new(Graph::new(odrs_graph::http_client()?, auth, paths.token_store())?);
     let store = Store::open(&paths.db())?;
@@ -37,37 +46,62 @@ pub async fn run(paths: &Paths, auth: AuthConfig, targets: Vec<Target>, mode: Sy
             String::new()
         }
     };
+    let drives = Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), version: 0 }));
+    let manager = Arc::new(Manager { graph: graph.clone(), config_path: paths.config(), cfg, drives: drives.clone() });
     let (tx, mut rx) = mpsc::unbounded_channel();
     let info = Info { account, sync_dir: sync_dir.display().to_string() };
-    let server = Server::start(info, tx).await.context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
-    for t in &targets {
-        tracing::info!(drive = %t.name, sync_dir = %t.opts.sync_dir.display(), "sync target");
-    }
+    let server = Server::start(info, tx, manager)
+        .await
+        .context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
     tracing::info!(interval = ?interval, ?mode, "daemon started");
 
-    // Local changes only matter when they are uploaded. Any change triggers a
-    // pass over all targets; a target without changes costs one /delta call
-    // and a local walk.
-    let mut watchers = Vec::new();
-    let mut local_rx = None;
-    if mode == SyncMode::Bidirectional {
-        let (tx, rx) = mpsc::unbounded_channel();
-        for t in &targets {
-            let skip = t.opts.filters.skip_file.clone();
-            let relevant: odrs_watch::Filter = Box::new(move |p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !skip.matches(n))
-            });
-            let w = odrs_watch::Watcher::new(&t.opts.sync_dir, relevant, tx.clone())
-                .with_context(|| format!("cannot watch {}", t.opts.sync_dir.display()))?;
-            watchers.push(w);
-        }
-        local_rx = Some(rx);
-    }
+    let mut statuses: Vec<DriveStatus> = Vec::new();
+    let mut watchers: Vec<odrs_watch::Watcher> = Vec::new();
+    let mut watched_version = None;
+    let (local_tx, local_rx) = mpsc::unbounded_channel();
+    let mut local_rx = (mode == SyncMode::Bidirectional).then_some(local_rx);
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut paused = false;
     let mut next = Instant::now();
     loop {
+        // Apply drive list changes (startup, AddDrive, RemoveDrive).
+        let (targets, version, removed) = {
+            let mut d = drives.lock().unwrap();
+            (d.targets.clone(), d.version, std::mem::take(&mut d.removed))
+        };
+        for drive_id in removed {
+            if let Some(root) = store.root(&drive_id)? {
+                store.delete(&root.drive_id, &root.id)?;
+                tracing::info!(drive_id, "drive removed from the database (local files kept)");
+            }
+        }
+        if watched_version != Some(version) {
+            for t in &targets {
+                tracing::info!(drive = %t.name, sync_dir = %t.opts.sync_dir.display(), "sync target");
+            }
+            if local_rx.is_some() {
+                // Local changes only matter when they are uploaded. Any change triggers a
+                // pass over all drives; a drive without changes costs one /delta call and a walk.
+                watchers.clear();
+                for t in &targets {
+                    if let Err(e) = std::fs::create_dir_all(&t.opts.sync_dir) {
+                        tracing::warn!(drive = %t.name, error = %e, "cannot create the sync folder");
+                    }
+                    let skip = t.opts.filters.skip_file.clone();
+                    let relevant: odrs_watch::Filter =
+                        Box::new(move |p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !skip.matches(n)));
+                    match odrs_watch::Watcher::new(&t.opts.sync_dir, relevant, local_tx.clone()) {
+                        Ok(w) => watchers.push(w),
+                        Err(e) => tracing::error!(drive = %t.name, error = %e, "cannot watch the sync folder"),
+                    }
+                }
+            }
+            statuses = targets.iter().map(|t| status_for(t, &statuses)).collect();
+            server.set_drives(statuses.clone()).await?;
+            watched_version = Some(version);
+        }
+
         // Wait for the next pass, a command or a shutdown signal.
         let wake = tokio::time::sleep_until(next.into());
         tokio::select! {
@@ -99,77 +133,171 @@ pub async fn run(paths: &Paths, auth: AuthConfig, targets: Vec<Target>, mode: Sy
         }
 
         server.set_state(State::Syncing).await?;
-        let stats = Arc::new(Stats::default());
-        let ticker = tokio::spawn({
-            let (server, stats) = (server.clone(), stats.clone());
-            async move {
-                let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
-                loop {
-                    tick.tick().await;
-                    let _ = server.set_progress(progress(&stats)).await;
-                }
-            }
-        });
+        let shared = Arc::new(Mutex::new(statuses.clone()));
         let started = Instant::now();
+        let mut sync_requested = false;
         let outcome = tokio::select! {
-            r = run_pass(&graph, &store, &targets, &stats, mode) => Some(r),
-            () = until_pause(&mut rx) => None,
-            _ = tokio::signal::ctrl_c() => { ticker.abort(); break }
-            _ = sigterm.recv() => { ticker.abort(); break }
+            r = run_pass(&graph, &store, &targets, mode, &server, &shared) => Some(r),
+            () = until_pause(&mut rx, &mut sync_requested) => None,
+            _ = tokio::signal::ctrl_c() => break,
+            _ = sigterm.recv() => break,
         };
-        ticker.abort();
-        server.set_progress(progress(&stats)).await?;
-        crate::print_stats(&stats, started, "pass");
+        statuses = shared.lock().unwrap().clone();
 
-        match outcome {
-            None => {
-                tracing::info!("pass cancelled, paused");
-                paused = true;
-                server.set_state(State::Paused).await?;
+        let Some(outcome) = outcome else {
+            tracing::info!("pass cancelled, paused");
+            for s in statuses.iter_mut().filter(|s| s.state == "syncing") {
+                s.state = "pending".into();
             }
-            Some(failures) if failures.is_empty() && stats.errors.load(Ordering::Relaxed) == 0 => {
-                server.finish_pass(Ok(now_rfc3339())).await?;
-                server.set_state(State::Idle).await?;
+            server.set_drives(statuses.clone()).await?;
+            paused = true;
+            server.set_state(State::Paused).await?;
+            continue;
+        };
+        tracing::info!(elapsed = ?started.elapsed(), "pass finished");
+        server.set_progress(outcome.total).await?;
+        if outcome.failures.is_empty() && outcome.total.errors == 0 {
+            server.finish_pass(Ok(now_rfc3339())).await?;
+            server.set_state(State::Idle).await?;
+        } else if outcome.failures.is_empty() {
+            let n = outcome.total.errors;
+            server.finish_pass(Err(format!("{n} item(s) failed, see the daemon log"))).await?;
+            server.set_state(State::Error).await?;
+        } else {
+            let mut msg = outcome.failures.iter().map(|(name, e)| format!("{name}: {e}")).collect::<Vec<_>>().join("; ");
+            if outcome.failures.iter().any(|(_, e)| e.is_auth()) {
+                // Recognised by the GUI, which then offers to sign in again.
+                msg = format!("{AUTH_ERROR_PREFIX} {msg}");
             }
-            Some(failures) if failures.is_empty() => {
-                let n = stats.errors.load(Ordering::Relaxed);
-                server.finish_pass(Err(format!("{n} item(s) failed, see the daemon log"))).await?;
-                server.set_state(State::Error).await?;
-            }
-            Some(failures) => {
-                let mut msg = failures.iter().map(|(name, e)| format!("{name}: {e}")).collect::<Vec<_>>().join("; ");
-                if failures.iter().any(|(_, e)| e.is_auth()) {
-                    // Recognised by the GUI, which then offers to sign in again.
-                    msg = format!("{AUTH_ERROR_PREFIX} {msg}");
-                }
-                server.finish_pass(Err(msg)).await?;
-                server.set_state(State::Error).await?;
-                if failures.iter().any(|(_, e)| e.is_network()) {
-                    next = Instant::now() + OFFLINE_RETRY;
-                    continue;
-                }
+            server.finish_pass(Err(msg)).await?;
+            server.set_state(State::Error).await?;
+            if outcome.failures.iter().any(|(_, e)| e.is_network()) {
+                next = Instant::now() + OFFLINE_RETRY;
+                continue;
             }
         }
         next = Instant::now() + interval;
-        if stats.deferred.load(Ordering::Relaxed) > 0 {
+        if outcome.deferred > 0 {
             // Files that were still being written: pick them up shortly.
             next = next.min(Instant::now() + 2 * DEBOUNCE);
+        }
+        if sync_requested || drives.lock().unwrap().version != version {
+            // Asked during the pass (e.g. a drive was added): do not wait for the interval.
+            next = Instant::now();
         }
     }
     tracing::info!("daemon stopping");
     Ok(())
 }
 
-/// One pass over every target, in order; a failing target does not stop the others.
-async fn run_pass(graph: &Arc<Graph>, store: &Store, targets: &[Target], stats: &Arc<Stats>, mode: SyncMode) -> Vec<(String, odrs_engine::Error)> {
-    let mut failures = Vec::new();
-    for t in targets {
-        if let Err(e) = odrs_engine::sync(graph.clone(), store, t.opts.clone(), stats.clone(), mode).await {
+/// Keep what is known about a drive across drive list changes.
+fn status_for(t: &Target, previous: &[DriveStatus]) -> DriveStatus {
+    match previous.iter().find(|s| s.name == t.name) {
+        Some(s) => DriveStatus { sync_dir: t.opts.sync_dir.display().to_string(), ..s.clone() },
+        None => DriveStatus {
+            name: t.name.clone(),
+            drive_id: t.opts.drive_id.clone().unwrap_or_default(),
+            sync_dir: t.opts.sync_dir.display().to_string(),
+            state: "pending".into(),
+            ..Default::default()
+        },
+    }
+}
+
+struct PassOutcome {
+    failures: Vec<(String, odrs_engine::Error)>,
+    total: Progress,
+    deferred: u64,
+}
+
+/// One pass over every drive, in order; a failing drive does not stop the
+/// others. `statuses` is updated live and published with the progress.
+async fn run_pass(
+    graph: &Arc<Graph>,
+    store: &Store,
+    targets: &[Target],
+    mode: SyncMode,
+    server: &Server,
+    statuses: &Arc<Mutex<Vec<DriveStatus>>>,
+) -> PassOutcome {
+    let mut out = PassOutcome { failures: Vec::new(), total: Progress::default(), deferred: 0 };
+    for (i, t) in targets.iter().enumerate() {
+        let stats = Arc::new(Stats::default());
+        let started = Instant::now();
+        set_status(statuses, i, |s| {
+            s.state = "syncing".into();
+            s.progress = Progress::default();
+        });
+        publish(server, statuses).await;
+        let ticker = tokio::spawn({
+            let (server, stats, statuses) = (server.clone(), stats.clone(), statuses.clone());
+            async move {
+                let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    let p = progress(&stats);
+                    set_status(&statuses, i, |s| s.progress = p);
+                    let _ = server.set_progress(p).await;
+                    publish(&server, &statuses).await;
+                }
+            }
+        });
+        let result = odrs_engine::sync(graph.clone(), store, t.opts.clone(), stats.clone(), mode).await;
+        ticker.abort();
+        let p = progress(&stats);
+        crate::print_stats(&stats, started, &t.name);
+        out.deferred += stats.deferred.load(Ordering::Relaxed);
+        add(&mut out.total, &p);
+        set_status(statuses, i, |s| {
+            s.progress = p;
+            match &result {
+                Ok(()) if p.errors == 0 => {
+                    s.state = "idle".into();
+                    s.last_sync = now_rfc3339();
+                    s.last_error.clear();
+                }
+                Ok(()) => {
+                    s.state = "error".into();
+                    s.last_error = format!("{} item(s) failed, see the daemon log", p.errors);
+                }
+                Err(e) => {
+                    s.state = "error".into();
+                    s.last_error = if e.is_auth() { format!("{AUTH_ERROR_PREFIX} {e}") } else { e.to_string() };
+                }
+            }
+        });
+        publish(server, statuses).await;
+        if let Err(e) = result {
             tracing::error!(drive = %t.name, error = %e, "sync pass failed");
-            failures.push((t.name.clone(), e));
+            out.failures.push((t.name.clone(), e));
         }
     }
-    failures
+    out
+}
+
+async fn publish(server: &Server, statuses: &Mutex<Vec<DriveStatus>>) {
+    let snapshot = statuses.lock().unwrap().clone();
+    if let Err(e) = server.set_drives(snapshot).await {
+        tracing::debug!(error = %e, "cannot publish drive statuses");
+    }
+}
+
+fn set_status(statuses: &Mutex<Vec<DriveStatus>>, i: usize, f: impl FnOnce(&mut DriveStatus)) {
+    if let Some(s) = statuses.lock().unwrap().get_mut(i) {
+        f(s);
+    }
+}
+
+fn add(total: &mut Progress, p: &Progress) {
+    total.items += p.items;
+    total.downloaded += p.downloaded;
+    total.bytes += p.bytes;
+    total.unchanged += p.unchanged;
+    total.deleted += p.deleted;
+    total.skipped += p.skipped;
+    total.errors += p.errors;
+    total.uploaded += p.uploaded;
+    total.deleted_online += p.deleted_online;
 }
 
 /// Next local change, or never when not watching.
@@ -180,11 +308,13 @@ async fn local_change(rx: &mut Option<mpsc::UnboundedReceiver<PathBuf>>) -> Opti
     }
 }
 
-/// Resolves when a `Pause` command arrives; other commands are ignored while a pass runs.
-async fn until_pause(rx: &mut mpsc::UnboundedReceiver<Command>) {
+/// Resolves when a `Pause` command arrives. A `SyncNow` during the pass is
+/// remembered so that another pass follows right away.
+async fn until_pause(rx: &mut mpsc::UnboundedReceiver<Command>, sync_requested: &mut bool) {
     loop {
         match rx.recv().await {
             Some(Command::Pause) => return,
+            Some(Command::SyncNow) => *sync_requested = true,
             Some(_) => {}
             None => std::future::pending().await,
         }
@@ -209,4 +339,95 @@ fn progress(s: &Stats) -> Progress {
 fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     odrs_engine::convert::format_db_time(time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH))
+}
+
+/// D-Bus drive management: Graph lookups answer directly; drive list changes
+/// are written to the config file and picked up by the loop before its next pass.
+struct Manager {
+    graph: Arc<Graph>,
+    config_path: PathBuf,
+    /// Global options (filters, permissions...) applied to new drives.
+    cfg: Config,
+    drives: Arc<Mutex<Drives>>,
+}
+
+impl DriveManager for Manager {
+    fn search_sites(&self, query: String) -> BoxFuture<'_, std::result::Result<Vec<Site>, String>> {
+        Box::pin(async move {
+            let query = if query.trim().is_empty() { "*".to_owned() } else { query.trim().to_owned() };
+            let sites = self.graph.search_sites(&query).await.map_err(|e| e.to_string())?;
+            let mut out: Vec<Site> = sites
+                .into_iter()
+                .map(|s| Site {
+                    name: s.display_name.or(s.name).unwrap_or_else(|| s.id.clone()),
+                    web_url: s.web_url.unwrap_or_default(),
+                    id: s.id,
+                })
+                .collect();
+            out.sort_by_key(|s| s.name.to_lowercase());
+            Ok(out)
+        })
+    }
+
+    fn list_libraries(&self, site_id: String) -> BoxFuture<'_, std::result::Result<Vec<Library>, String>> {
+        Box::pin(async move {
+            let drives = self.graph.site_drives(&site_id).await.map_err(|e| e.to_string())?;
+            Ok(drives
+                .into_iter()
+                .filter(|d| d.drive_type.as_deref() == Some("documentLibrary"))
+                .map(|d| Library { name: d.name.unwrap_or_else(|| d.id.clone()), web_url: d.web_url.unwrap_or_default(), drive_id: d.id })
+                .collect())
+        })
+    }
+
+    fn add_drive(&self, name: String, drive_id: String, sync_dir: String) -> std::result::Result<(), String> {
+        let name = name.trim().to_owned();
+        let sync_dir = config::expand_home(sync_dir.trim());
+        let mut drives = self.drives.lock().unwrap();
+        let current = configured(&drives.targets);
+        let main_dir = drives.targets.first().map(|t| t.opts.sync_dir.clone()).unwrap_or_default();
+        config::validate_new_drive(&current, &main_dir, &name, &drive_id, &sync_dir).map_err(|e| e.to_string())?;
+        let d = DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone() };
+        config::append_drive_section(&self.config_path, &d).map_err(|e| e.to_string())?;
+        let mut opts = self.cfg.sync_options(sync_dir);
+        opts.drive_id = Some(drive_id);
+        if let Some(main) = drives.targets.first() {
+            opts.max_transfers = main.opts.max_transfers;
+        }
+        drives.targets.push(Target { name: name.clone(), opts });
+        drives.version += 1;
+        tracing::info!(drive = %name, "drive added");
+        Ok(())
+    }
+
+    fn remove_drive(&self, name: String) -> std::result::Result<(), String> {
+        if name.eq_ignore_ascii_case("main") {
+            return Err("the account's own OneDrive cannot be removed".into());
+        }
+        let mut drives = self.drives.lock().unwrap();
+        let Some(i) = drives.targets.iter().position(|t| t.name == name) else {
+            return Err(format!("no drive named \"{name}\""));
+        };
+        config::remove_drive_section(&self.config_path, &name).map_err(|e| e.to_string())?;
+        let removed = drives.targets.remove(i);
+        if let Some(id) = removed.opts.drive_id {
+            drives.removed.push(id);
+        }
+        drives.version += 1;
+        tracing::info!(drive = %name, "drive removed (local files kept)");
+        Ok(())
+    }
+}
+
+/// The configured libraries, for validation.
+fn configured(targets: &[Target]) -> Config {
+    Config {
+        drives: targets
+            .iter()
+            .filter_map(|t| {
+                Some(DriveConfig { name: t.name.clone(), drive_id: t.opts.drive_id.clone()?, sync_dir: t.opts.sync_dir.clone() })
+            })
+            .collect(),
+        ..Default::default()
+    }
 }

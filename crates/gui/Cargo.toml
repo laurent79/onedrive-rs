@@ -11,6 +11,7 @@ thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["parsing"] }
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1.44"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 slint-build = "1.18.1"

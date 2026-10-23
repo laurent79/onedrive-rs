@@ -1,10 +1,12 @@
-//! Desktop UI: a status window and a tray icon (StatusNotifierItem), both
-//! driven over D-Bus by the daemon. The UI never performs sync I/O itself.
+//! Desktop UI: a status window listing the synchronised drives, a window to add
+//! a SharePoint library, and a tray icon (StatusNotifierItem), all driven over
+//! D-Bus by the daemon. The UI never performs sync I/O itself.
 
+use std::rc::Rc;
 use std::time::Duration;
 
-use odrs_ipc::{Client, Snapshot};
-use slint::ComponentHandle as _;
+use odrs_ipc::{Client, DriveStatus, Snapshot};
+use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
 use tokio::sync::mpsc;
 
 slint::include_modules!();
@@ -27,11 +29,15 @@ pub struct Options {
     pub login: Box<dyn Fn() -> std::io::Result<std::process::Child>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum UiCommand {
     SyncNow,
     TogglePause,
     Refresh,
+    RemoveDrive(String),
+    SearchSites(String),
+    ListLibraries(String),
+    AddDrive { name: String, drive_id: String, sync_dir: String },
 }
 
 /// Run the UI on the current thread until the user quits from the tray menu.
@@ -42,13 +48,16 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     // from which Wayland compositors take the window icon.
     slint::set_xdg_app_id(APP_ID)?;
     let tray = Tray::new()?;
+    let add = AddLibraryWindow::new()?;
     let initial = to_status(None);
     window.set_status(initial.clone());
     tray.set_status(initial);
+    // Updated in place, so rows (and their pending "confirm removal") survive refreshes.
+    window.set_drives(ModelRc::from(Rc::new(VecModel::<DriveRow>::default())));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let start_daemon = std::rc::Rc::new(opts.start_daemon);
-    let login = std::rc::Rc::new(opts.login);
+    let start_daemon = Rc::new(opts.start_daemon);
+    let login = Rc::new(opts.login);
 
     // Globals are per component instance: wire the window and the tray alike.
     macro_rules! wire {
@@ -62,10 +71,15 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
             logic.on_toggle_pause(move || {
                 let _ = t.send(UiCommand::TogglePause);
             });
-            let w = window.as_weak();
-            logic.on_open_folder(move || {
-                if let Some(w) = w.upgrade() {
-                    open_folder(&w.get_status().sync_dir);
+            logic.on_open_folder(|path| open_folder(&path));
+            let t = tx.clone();
+            logic.on_remove_drive(move |name| {
+                let _ = t.send(UiCommand::RemoveDrive(name.into()));
+            });
+            let (a, t) = (add.as_weak(), tx.clone());
+            logic.on_add_library(move || {
+                if let Some(a) = a.upgrade() {
+                    open_add_window(&a, &t);
                 }
             });
             let (t, start) = (tx.clone(), start_daemon.clone());
@@ -100,8 +114,9 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     }
     wire!(window);
     wire!(tray);
+    wire_add_window(&add, &tx);
 
-    rt.spawn(poll(rx, window.as_weak(), tray.as_weak()));
+    rt.spawn(poll(rx, window.as_weak(), tray.as_weak(), add.as_weak()));
 
     if !opts.hidden {
         window.show()?;
@@ -111,8 +126,88 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     Ok(())
 }
 
+fn open_add_window(a: &AddLibraryWindow, tx: &mpsc::UnboundedSender<UiCommand>) {
+    a.set_query(SharedString::new());
+    a.set_name(SharedString::new());
+    a.set_folder(SharedString::new());
+    a.set_site_index(-1);
+    a.set_library_index(-1);
+    a.set_libraries(ModelRc::default());
+    a.set_message(SharedString::new());
+    a.set_no_results(false);
+    a.set_busy(true);
+    let _ = a.show();
+    // Start with every site the account can see.
+    let _ = tx.send(UiCommand::SearchSites(String::new()));
+}
+
+fn wire_add_window(add: &AddLibraryWindow, tx: &mpsc::UnboundedSender<UiCommand>) {
+    let (a, t) = (add.as_weak(), tx.clone());
+    add.on_search(move |query| {
+        if let Some(a) = a.upgrade() {
+            a.set_busy(true);
+            a.set_site_index(-1);
+            a.set_library_index(-1);
+            a.set_libraries(ModelRc::default());
+        }
+        let _ = t.send(UiCommand::SearchSites(query.into()));
+    });
+    let (a, t) = (add.as_weak(), tx.clone());
+    add.on_site_selected(move |i| {
+        let Some(a) = a.upgrade() else { return };
+        let Some(id) = usize::try_from(i).ok().and_then(|i| a.get_site_ids().row_data(i)) else { return };
+        a.set_library_index(-1);
+        a.set_libraries(ModelRc::default());
+        a.set_busy(true);
+        let _ = t.send(UiCommand::ListLibraries(id.into()));
+    });
+    let a = add.as_weak();
+    add.on_library_selected(move |i| {
+        let Some(a) = a.upgrade() else { return };
+        let (Ok(i), Ok(s)) = (usize::try_from(i), usize::try_from(a.get_site_index())) else { return };
+        let library = a.get_libraries().row_data(i).map(|l| l.text).unwrap_or_default();
+        let site = a.get_sites().row_data(s).map(|l| l.text).unwrap_or_default();
+        let name = default_name(&site, &library);
+        a.set_folder(default_folder(&name).into());
+        a.set_name(name.into());
+    });
+    let (a, t) = (add.as_weak(), tx.clone());
+    add.on_add(move |name, folder| {
+        let Some(a) = a.upgrade() else { return };
+        let Some(drive_id) = usize::try_from(a.get_library_index()).ok().and_then(|i| a.get_library_ids().row_data(i)) else {
+            return;
+        };
+        a.set_busy(true);
+        a.set_message(SharedString::new());
+        let _ = t.send(UiCommand::AddDrive { name: name.into(), drive_id: drive_id.into(), sync_dir: folder.into() });
+    });
+    let a = add.as_weak();
+    add.on_cancel(move || {
+        if let Some(a) = a.upgrade() {
+            let _ = a.hide();
+        }
+    });
+}
+
+/// "Documents" is the default library of every site: name it after the site.
+fn default_name(site: &str, library: &str) -> String {
+    let generic = ["documents", "shared documents", "documents partagés", "documents partages", "gedeelde documenten"];
+    let name = if generic.contains(&library.to_lowercase().as_str()) || library.is_empty() { site } else { library };
+    name.replace(['/', '\\', '"', '[', ']'], "-").trim().to_owned()
+}
+
+fn default_folder(name: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/SharePoint/{name}")
+}
+
 /// Refresh the UI from the daemon every [`REFRESH`] and forward user commands.
-async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>, window: slint::Weak<MainWindow>, tray: slint::Weak<Tray>) {
+async fn poll(
+    mut rx: mpsc::UnboundedReceiver<UiCommand>,
+    window: slint::Weak<MainWindow>,
+    tray: slint::Weak<Tray>,
+    add: slint::Weak<AddLibraryWindow>,
+) {
     let client = loop {
         match Client::new().await {
             Ok(c) => break c,
@@ -129,15 +224,7 @@ async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>, window: slint::Weak<Ma
             _ = tick.tick() => {}
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return };
-                let result = match cmd {
-                    UiCommand::SyncNow => client.daemon().sync_now().await,
-                    UiCommand::TogglePause if last.as_ref().is_some_and(|s| s.state == "paused") => client.daemon().resume().await,
-                    UiCommand::TogglePause => client.daemon().pause().await,
-                    UiCommand::Refresh => Ok(()),
-                };
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, ?cmd, "daemon command failed");
-                }
+                handle(&client, cmd, last.as_ref(), &add).await;
             }
         }
         let snapshot = match client.snapshot().await {
@@ -148,11 +235,15 @@ async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>, window: slint::Weak<Ma
             }
         };
         let status = to_status(snapshot.as_ref());
+        let rows: Vec<DriveRow> = snapshot.as_ref().map(|s| s.drives.iter().map(to_row).collect()).unwrap_or_default();
         last = snapshot;
         let s = status.clone();
         let _ = window.upgrade_in_event_loop(move |w| {
             if w.get_status() != s {
                 w.set_status(s);
+            }
+            if let Some(model) = w.get_drives().as_any().downcast_ref::<VecModel<DriveRow>>() {
+                sync_rows(model, rows);
             }
         });
         let _ = tray.upgrade_in_event_loop(move |t| {
@@ -163,26 +254,135 @@ async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>, window: slint::Weak<Ma
     }
 }
 
+async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>, add: &slint::Weak<AddLibraryWindow>) {
+    let d = client.daemon();
+    match cmd {
+        UiCommand::SyncNow => report(d.sync_now().await, "sync now"),
+        UiCommand::TogglePause if last.is_some_and(|s| s.state == "paused") => report(d.resume().await, "resume"),
+        UiCommand::TogglePause => report(d.pause().await, "pause"),
+        UiCommand::Refresh => {}
+        UiCommand::RemoveDrive(name) => report(d.remove_drive(&name).await, "remove drive"),
+        UiCommand::SearchSites(query) => {
+            let result = d.search_sites(&query).await;
+            let _ = add.upgrade_in_event_loop(move |a| {
+                a.set_busy(false);
+                match result {
+                    Ok(sites) => {
+                        a.set_no_results(sites.is_empty());
+                        a.set_message(SharedString::new());
+                        a.set_message_is_error(false);
+                        a.set_sites(list(sites.iter().map(|s| s.name.as_str())));
+                        a.set_site_ids(strings(sites.iter().map(|s| s.id.as_str())));
+                    }
+                    Err(e) => show_error(&a, &e),
+                }
+            });
+        }
+        UiCommand::ListLibraries(site_id) => {
+            let result = d.list_libraries(&site_id).await;
+            let _ = add.upgrade_in_event_loop(move |a| {
+                a.set_busy(false);
+                match result {
+                    Ok(libs) => {
+                        a.set_libraries(list(libs.iter().map(|l| l.name.as_str())));
+                        a.set_library_ids(strings(libs.iter().map(|l| l.drive_id.as_str())));
+                        if libs.len() == 1 {
+                            // Most sites only have "Documents": select it.
+                            a.set_library_index(0);
+                            a.invoke_library_selected(0);
+                        }
+                    }
+                    Err(e) => show_error(&a, &e),
+                }
+            });
+        }
+        UiCommand::AddDrive { name, drive_id, sync_dir } => {
+            let result = d.add_drive(&name, &drive_id, &sync_dir).await;
+            let _ = add.upgrade_in_event_loop(move |a| {
+                a.set_busy(false);
+                match result {
+                    Ok(()) => {
+                        let _ = a.hide();
+                    }
+                    Err(e) => show_error(&a, &e),
+                }
+            });
+        }
+    }
+}
+
+fn report(result: zbus::Result<()>, what: &str) {
+    if let Err(e) = result {
+        tracing::warn!(error = %e, what, "daemon command failed");
+    }
+}
+
+fn show_error(a: &AddLibraryWindow, e: &zbus::Error) {
+    // Daemon-side failures arrive as org.freedesktop.DBus.Error.Failed with a readable message.
+    let msg = match e {
+        zbus::Error::MethodError(_, Some(detail), _) => detail.clone(),
+        other => other.to_string(),
+    };
+    a.set_no_results(false);
+    a.set_message(msg.into());
+    a.set_message_is_error(true);
+}
+
+fn list<'a>(items: impl Iterator<Item = &'a str>) -> ModelRc<StandardListViewItem> {
+    let v: Vec<StandardListViewItem> = items.map(StandardListViewItem::from).collect();
+    ModelRc::from(Rc::new(VecModel::from(v)))
+}
+
+fn strings<'a>(items: impl Iterator<Item = &'a str>) -> ModelRc<SharedString> {
+    let v: Vec<SharedString> = items.map(SharedString::from).collect();
+    ModelRc::from(Rc::new(VecModel::from(v)))
+}
+
+/// Update rows in place: unchanged rows keep their UI state.
+fn sync_rows(model: &VecModel<DriveRow>, rows: Vec<DriveRow>) {
+    for (i, row) in rows.iter().enumerate() {
+        match model.row_data(i) {
+            Some(current) if current == *row => {}
+            Some(current) if current.name == row.name => model.set_row_data(i, row.clone()),
+            Some(_) => {
+                // Another drive now at this position (one was added or removed): rebuild.
+                model.set_vec(rows);
+                return;
+            }
+            None => model.push(row.clone()),
+        }
+    }
+    while model.row_count() > rows.len() {
+        model.remove(model.row_count() - 1);
+    }
+}
+
+fn to_row(d: &DriveStatus) -> DriveRow {
+    let int = |v: u64| i32::try_from(v).unwrap_or(i32::MAX);
+    DriveRow {
+        title: if d.name == "main" { "OneDrive".into() } else { d.name.as_str().into() },
+        removable: d.name != "main",
+        name: d.name.as_str().into(),
+        sync_dir: d.sync_dir.as_str().into(),
+        state: d.state.as_str().into(),
+        last_error: d.last_error.trim_start_matches(odrs_ipc::AUTH_ERROR_PREFIX).trim().into(),
+        last_sync_mins: minutes_since(&d.last_sync).unwrap_or(-1),
+        items: int(d.progress.items),
+        downloaded: int(d.progress.downloaded),
+        uploaded: int(d.progress.uploaded),
+    }
+}
+
 fn to_status(s: Option<&Snapshot>) -> Status {
     let Some(s) = s else {
-        return Status { state: "stopped".into(), last_sync_mins: -1, ..Default::default() };
+        return Status { state: "stopped".into(), ..Default::default() };
     };
-    let p = &s.progress;
-    let int = |v: u64| i32::try_from(v).unwrap_or(i32::MAX);
     Status {
         state: s.state.as_str().into(),
         account: s.account.as_str().into(),
         sync_dir: s.sync_dir.as_str().into(),
         last_error: s.last_error.trim_start_matches(odrs_ipc::AUTH_ERROR_PREFIX).trim().into(),
         needs_login: s.last_error.starts_with(odrs_ipc::AUTH_ERROR_PREFIX),
-        last_sync_mins: minutes_since(&s.last_sync).unwrap_or(-1),
-        items: int(p.items),
-        downloaded: int(p.downloaded),
-        gib: p.bytes as f32 / (1u64 << 30) as f32,
-        unchanged: int(p.unchanged),
-        uploaded: int(p.uploaded),
-        skipped: int(p.skipped),
-        errors: int(p.errors),
     }
 }
 
@@ -198,5 +398,17 @@ fn open_folder(path: &str) {
     }
     if let Err(e) = std::process::Command::new("xdg-open").arg(path).spawn() {
         tracing::error!(error = %e, path, "xdg-open failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_names() {
+        assert_eq!(default_name("Engineering", "Documents"), "Engineering");
+        assert_eq!(default_name("Direction", "Contrats"), "Contrats");
+        assert_eq!(default_name("A/B", "Documents partagés"), "A-B");
     }
 }

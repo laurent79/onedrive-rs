@@ -1,29 +1,41 @@
-import { Button, GroupBox, Spinner, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+import { Button, LineEdit, ListView, Spinner, StandardListView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
 
-// Everything the UI shows, pushed from Rust once per second.
+// Daemon-wide state, pushed from Rust once per second.
 export struct Status {
     // "idle" | "syncing" | "paused" | "error" | "stopped" (daemon not running)
     state: string,
     account: string,
+    // Folder of the account's own OneDrive.
     sync-dir: string,
     last-error: string,
     // The stored login expired: offer to sign in again.
     needs-login: bool,
-    // Minutes since the last successful pass, -1 if never.
+}
+
+// One synchronised drive (the account's OneDrive or a SharePoint library).
+export struct DriveRow {
+    // Identifier for commands: "main" or the [drive] name.
+    name: string,
+    // Shown to the user.
+    title: string,
+    sync-dir: string,
+    // "idle" | "syncing" | "error" | "pending"
+    state: string,
+    last-error: string,
+    // Minutes since its last successful pass, -1 if never.
     last-sync-mins: int,
     items: int,
     downloaded: int,
-    gib: float,
-    unchanged: int,
     uploaded: int,
-    skipped: int,
-    errors: int,
+    removable: bool,
 }
 
 export global Logic {
     callback sync-now();
     callback toggle-pause();
-    callback open-folder();
+    callback open-folder(string);
+    callback remove-drive(string);
+    callback add-library();
     callback start-daemon();
     callback reconnect();
     callback show-window();
@@ -54,24 +66,79 @@ global Fmt {
         if mins < 120 { return @tr("{n} minute ago" | "{n} minutes ago" % mins); }
         return @tr("{n} hour ago" | "{n} hours ago" % floor(mins / 60));
     }
+
+    public pure function drive-detail(d: DriveRow) -> string {
+        if d.state == "syncing" {
+            return @tr("Synchronising… {} items checked, {} downloaded, {} uploaded", d.items, d.downloaded, d.uploaded);
+        }
+        if d.state == "error" { return d.last-error; }
+        if d.state == "pending" { return @tr("Waiting for its first pass"); }
+        return @tr("Up to date, last sync {}", self.last-sync-label(d.last-sync-mins));
+    }
 }
 
-component Row inherits HorizontalLayout {
-    in property <string> label;
-    in property <string> value;
-    spacing: 12px;
-    Text { text: label; color: Palette.foreground.transparentize(40%); min-width: 140px; }
-    Text { text: value; horizontal-stretch: 1; overflow: elide; }
+component DriveView inherits Rectangle {
+    in property <DriveRow> drive;
+    // Removal needs a second click.
+    property <bool> confirm: false;
+    border-radius: 6px;
+    background: Palette.alternate-background;
+
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: drive.state == "error" ? #c62828
+                    : drive.state == "syncing" ? #0f6cbd
+                    : drive.state == "idle" ? #2e7d32
+                    : #9e9e9e;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text { text: drive.title; font-weight: 600; overflow: elide; }
+            Text { text: drive.sync-dir; font-size: 11px; color: Palette.alternate-foreground.transparentize(30%); overflow: elide; }
+            Text {
+                text: Fmt.drive-detail(drive);
+                color: drive.state == "error" ? #c62828 : Palette.alternate-foreground.transparentize(20%);
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            Button {
+                text: @tr("Open");
+                clicked => { Logic.open-folder(drive.sync-dir); }
+            }
+            if drive.removable: Button {
+                text: root.confirm ? @tr("Confirm removal") : @tr("Remove");
+                clicked => {
+                    if root.confirm {
+                        Logic.remove-drive(drive.name);
+                    } else {
+                        root.confirm = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 export component MainWindow inherits Window {
     in property <Status> status;
+    in property <[DriveRow]> drives;
     title: "OneDrive";
     icon: @image-url("../icons/app.png");
-    preferred-width: 460px;
-    min-width: 380px;
-    // The window is not resized when sections appear: size it for the largest state.
-    min-height: 380px;
+    preferred-width: 560px;
+    min-width: 420px;
+    min-height: 440px;
 
     VerticalBox {
         HorizontalBox {
@@ -90,20 +157,20 @@ export component MainWindow inherits Window {
             }
         }
 
-        if status.state != "stopped": GroupBox {
-            title: status.state == "syncing" ? @tr("Current pass") : @tr("Last pass");
-            VerticalLayout {
-                spacing: 4px;
-                Row { label: @tr("Folder"); value: status.sync-dir; }
-                Row { label: @tr("Last success"); value: Fmt.last-sync-label(status.last-sync-mins); }
-                Row { label: @tr("Items checked"); value: status.items; }
-                Row { label: @tr("Downloaded"); value: @tr("{} files ({} GiB)", status.downloaded, round(status.gib * 10) / 10); }
-                Row { label: @tr("Unchanged"); value: status.unchanged; }
-                Row { label: @tr("Uploaded"); value: status.uploaded; }
-                Row { label: @tr("Skipped"); value: status.skipped; }
-                Row { label: @tr("Errors"); value: status.errors; }
+        if status.state == "stopped": Text {
+            text: @tr("The onedrive-rs background service is not running. Start it to keep your files in sync.");
+            wrap: word-wrap;
+        }
+
+        if status.state != "stopped": ListView {
+            vertical-stretch: 1;
+            for d in root.drives: VerticalLayout {
+                padding-bottom: 6px;
+                DriveView { drive: d; }
             }
         }
+
+        if status.state == "stopped": Rectangle { vertical-stretch: 1; }
 
         if status.last-error != "": Text {
             text: status.last-error;
@@ -111,16 +178,13 @@ export component MainWindow inherits Window {
             wrap: word-wrap;
         }
 
-        if status.state == "stopped": Text {
-            text: @tr("The onedrive-rs background service is not running. Start it to keep your files in sync.");
-            wrap: word-wrap;
-        }
-
-        Rectangle { vertical-stretch: 1; }
-
         HorizontalBox {
             padding: 0;
-            alignment: end;
+            if status.state != "stopped": Button {
+                text: @tr("Add a library…");
+                clicked => { Logic.add-library(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
             if status.needs-login: Button {
                 text: @tr("Sign in again");
                 primary: true;
@@ -140,10 +204,102 @@ export component MainWindow inherits Window {
                 text: status.state == "paused" ? @tr("Resume") : @tr("Pause");
                 clicked => { Logic.toggle-pause(); }
             }
+        }
+    }
+}
+
+// Pick a SharePoint site, then one of its document libraries, then where to sync it.
+export component AddLibraryWindow inherits Window {
+    in property <[StandardListViewItem]> sites;
+    in property <[StandardListViewItem]> libraries;
+    // Ids matching the lists above, used by Rust.
+    in property <[string]> site-ids;
+    in property <[string]> library-ids;
+    in-out property <string> query;
+    in-out property <string> name;
+    in-out property <string> folder;
+    in-out property <int> site-index: -1;
+    in-out property <int> library-index: -1;
+    in property <string> message;
+    in property <bool> message-is-error;
+    in property <bool> no-results;
+    in property <bool> busy;
+    callback search(string);
+    callback site-selected(int);
+    callback library-selected(int);
+    callback add(string, string);
+    callback cancel();
+
+    title: @tr("Add a SharePoint library");
+    icon: @image-url("../icons/app.png");
+    preferred-width: 560px;
+    min-width: 420px;
+    min-height: 520px;
+
+    VerticalBox {
+        Text { text: @tr("1. Find the SharePoint site"); font-weight: 600; }
+        HorizontalBox {
+            padding: 0;
+            LineEdit {
+                text <=> root.query;
+                placeholder-text: @tr("Site name (leave empty for all sites)");
+                horizontal-stretch: 1;
+                accepted => { root.search(root.query); }
+            }
             Button {
-                text: @tr("Open folder");
-                enabled: status.sync-dir != "";
-                clicked => { Logic.open-folder(); }
+                text: @tr("Search");
+                clicked => { root.search(root.query); }
+            }
+        }
+        StandardListView {
+            model: root.sites;
+            current-item <=> root.site-index;
+            current-item-changed(i) => { root.site-selected(i); }
+            min-height: 120px;
+            vertical-stretch: 2;
+        }
+
+        Text { text: @tr("2. Choose the library"); font-weight: 600; }
+        StandardListView {
+            model: root.libraries;
+            current-item <=> root.library-index;
+            current-item-changed(i) => { root.library-selected(i); }
+            min-height: 70px;
+            vertical-stretch: 1;
+        }
+
+        Text { text: @tr("3. Name and local folder"); font-weight: 600; }
+        GridLayout {
+            spacing: 8px;
+            Row {
+                Text { text: @tr("Name"); vertical-alignment: center; }
+                LineEdit { text <=> root.name; }
+            }
+            Row {
+                Text { text: @tr("Folder"); vertical-alignment: center; }
+                LineEdit { text <=> root.folder; }
+            }
+        }
+
+        HorizontalBox {
+            padding: 0;
+            if root.busy: Spinner { indeterminate: true; width: 18px; height: 18px; }
+            Text {
+                text: root.no-results ? @tr("No site found") : root.message;
+                color: root.message-is-error ? #c62828 : Palette.foreground;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.cancel(); }
+            }
+            Button {
+                text: @tr("Add");
+                primary: true;
+                enabled: root.library-index >= 0 && root.name != "" && root.folder != "" && !root.busy;
+                clicked => { root.add(root.name, root.folder); }
             }
         }
     }
@@ -175,7 +331,7 @@ export component Tray inherits SystemTrayIcon {
             enabled: status.state != "stopped";
             activated => { Logic.toggle-pause(); }
         }
-        MenuItem { title: @tr("Open folder"); enabled: status.sync-dir != ""; activated => { Logic.open-folder(); } }
+        MenuItem { title: @tr("Open folder"); enabled: status.sync-dir != ""; activated => { Logic.open-folder(status.sync-dir); } }
         MenuSeparator { }
         MenuItem { title: @tr("Quit"); activated => { Logic.quit(); } }
     }

@@ -90,14 +90,13 @@ async fn import_library(
         .or_else(|| sync_dir.file_name().map(|n| n.to_string_lossy().into_owned()))
         .context("cannot derive a drive name; use --name")?;
     let ours = Config::load(&paths.config())?;
-    if ours.drives.iter().any(|d| d.drive_id == drive_id && !force) {
+    let already = ours.drives.iter().any(|d| d.drive_id == drive_id);
+    if already && !force {
         bail!("drive {drive_id} is already configured; use --force to import it again");
     }
-    if let Some(d) = ours.drives.iter().find(|d| d.name.eq_ignore_ascii_case(&name) && d.drive_id != drive_id) {
-        bail!("a drive named \"{}\" already exists; choose another with --name", d.name);
-    }
-    if ours.sync_dir.as_ref().is_some_and(|m| m.starts_with(&sync_dir) || sync_dir.starts_with(m)) {
-        bail!("{} overlaps the main sync folder", sync_dir.display());
+    if !already {
+        let main_dir = ours.sync_dir.clone().unwrap_or_else(|| config::expand_home("~/OneDrive-rs"));
+        config::validate_new_drive(&ours, &main_dir, &name, &drive_id, &sync_dir)?;
     }
 
     // Our login must be able to reach the library.
@@ -115,13 +114,8 @@ async fn import_library(
     let root = store.root(&drive_id)?.context("the D database has no root for this drive")?;
     let has_cursor = store.delta_link(&root.drive_id, &root.id)?.is_some();
 
-    if !ours.drives.iter().any(|d| d.drive_id == drive_id) {
-        let mut text = std::fs::read_to_string(paths.config()).unwrap_or_default();
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&format!("\n[drive \"{name}\"]\ndrive_id = \"{drive_id}\"\nsync_dir = \"{}\"\n", sync_dir.display()));
-        std::fs::write(paths.config(), text)?;
+    if !already {
+        config::append_drive_section(&paths.config(), &config::DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone() })?;
     }
     let kind = drive.drive_type.as_deref().unwrap_or("?");
     eprintln!("Imported {rows} items of {kind} drive \"{name}\" ({drive_id}), sync cursor: {}", if has_cursor { "yes" } else { "no" });

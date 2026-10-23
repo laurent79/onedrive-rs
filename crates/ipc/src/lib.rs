@@ -2,6 +2,10 @@
 //! clients (GUI, CLI). The daemon owns all sync I/O; clients only observe and
 //! send commands.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -50,6 +54,53 @@ pub struct Progress {
     pub deleted_online: u64,
 }
 
+/// State of one synchronised drive, in the `Drives` property.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
+pub struct DriveStatus {
+    /// `main` for the account's own OneDrive, else the `[drive]` section name.
+    pub name: String,
+    /// Empty for `main`.
+    pub drive_id: String,
+    pub sync_dir: String,
+    /// "idle" | "syncing" | "error" | "pending" (not synced yet since the daemon started)
+    pub state: String,
+    /// RFC 3339 time of its last successful pass, empty if none.
+    pub last_sync: String,
+    pub last_error: String,
+    /// Counters of its current or last pass.
+    pub progress: Progress,
+}
+
+/// A SharePoint site, from `SearchSites`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct Site {
+    pub id: String,
+    pub name: String,
+    pub web_url: String,
+}
+
+/// A document library (drive) of a site, from `ListLibraries`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct Library {
+    pub drive_id: String,
+    pub name: String,
+    pub web_url: String,
+}
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Drive management offered by the daemon. Answers do not wait for the sync
+/// loop, so they stay responsive during a long pass. Errors are user-facing messages.
+pub trait DriveManager: Send + Sync + 'static {
+    /// Sites matching `query` (empty: all sites the account can see).
+    fn search_sites(&self, query: String) -> BoxFuture<'_, std::result::Result<Vec<Site>, String>>;
+    fn list_libraries(&self, site_id: String) -> BoxFuture<'_, std::result::Result<Vec<Library>, String>>;
+    /// Add a `[drive]` to the configuration; it is synced from the next pass.
+    fn add_drive(&self, name: String, drive_id: String, sync_dir: String) -> std::result::Result<(), String>;
+    /// Stop syncing a `[drive]`; its local files are kept.
+    fn remove_drive(&self, name: String) -> std::result::Result<(), String>;
+}
+
 /// Commands sent by clients to the daemon loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -71,7 +122,9 @@ struct Service {
     last_sync: String,
     last_error: String,
     progress: Progress,
+    drives: Vec<DriveStatus>,
     commands: mpsc::UnboundedSender<Command>,
+    manager: Arc<dyn DriveManager>,
 }
 
 impl Service {
@@ -94,6 +147,30 @@ impl Service {
 
     async fn resume(&self) -> zbus::fdo::Result<()> {
         self.send(Command::Resume)
+    }
+
+    async fn search_sites(&self, query: String) -> zbus::fdo::Result<Vec<Site>> {
+        self.manager.search_sites(query).await.map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn list_libraries(&self, site_id: String) -> zbus::fdo::Result<Vec<Library>> {
+        self.manager.list_libraries(site_id).await.map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn add_drive(&self, name: String, drive_id: String, sync_dir: String) -> zbus::fdo::Result<()> {
+        self.manager.add_drive(name, drive_id, sync_dir).map_err(zbus::fdo::Error::Failed)?;
+        self.send(Command::SyncNow)
+    }
+
+    async fn remove_drive(&self, name: String) -> zbus::fdo::Result<()> {
+        self.manager.remove_drive(name).map_err(zbus::fdo::Error::Failed)?;
+        self.send(Command::SyncNow)
+    }
+
+    /// One entry per synchronised drive, `main` first.
+    #[zbus(property)]
+    async fn drives(&self) -> Vec<DriveStatus> {
+        self.drives.clone()
     }
 
     #[zbus(property)]
@@ -139,14 +216,16 @@ pub struct Server {
 impl Server {
     /// Claim [`BUS_NAME`] on the session bus and serve the interface.
     /// Fails if another daemon already owns the name.
-    pub async fn start(info: Info, commands: mpsc::UnboundedSender<Command>) -> Result<Self> {
+    pub async fn start(info: Info, commands: mpsc::UnboundedSender<Command>, manager: Arc<dyn DriveManager>) -> Result<Self> {
         let service = Service {
             info,
             state: State::Idle,
             last_sync: String::new(),
             last_error: String::new(),
             progress: Progress::default(),
+            drives: Vec::new(),
             commands,
+            manager,
         };
         let conn = zbus::connection::Builder::session()?
             .name(BUS_NAME)?
@@ -179,6 +258,15 @@ impl Server {
         Ok(())
     }
 
+    pub async fn set_drives(&self, drives: Vec<DriveStatus>) -> Result<()> {
+        let mut s = self.iface.get_mut().await;
+        if s.drives != drives {
+            s.drives = drives;
+            s.drives_changed(self.emitter()).await?;
+        }
+        Ok(())
+    }
+
     /// Record the end of a pass: `Ok(time)` on success, `Err(message)` on failure.
     pub async fn finish_pass(&self, result: std::result::Result<String, String>) -> Result<()> {
         let mut s = self.iface.get_mut().await;
@@ -206,6 +294,12 @@ pub trait OneDrive {
     fn sync_now(&self) -> zbus::Result<()>;
     fn pause(&self) -> zbus::Result<()>;
     fn resume(&self) -> zbus::Result<()>;
+    fn search_sites(&self, query: &str) -> zbus::Result<Vec<Site>>;
+    fn list_libraries(&self, site_id: &str) -> zbus::Result<Vec<Library>>;
+    fn add_drive(&self, name: &str, drive_id: &str, sync_dir: &str) -> zbus::Result<()>;
+    fn remove_drive(&self, name: &str) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn drives(&self) -> zbus::Result<Vec<DriveStatus>>;
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
     #[zbus(property)]
@@ -229,6 +323,7 @@ pub struct Snapshot {
     pub account: String,
     pub sync_dir: String,
     pub progress: Progress,
+    pub drives: Vec<DriveStatus>,
 }
 
 /// Session-bus client usable whether or not the daemon is running (it may
@@ -269,10 +364,11 @@ impl Client {
         let (state, last_sync, last_error, account, sync_dir) =
             (text("State"), text("LastSync"), text("LastError"), text("Account"), text("SyncDir"));
         let progress = all.remove("Progress").and_then(|v| Progress::try_from(v).ok()).unwrap_or_default();
-        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress }))
+        let drives = all.remove("Drives").and_then(|v| Vec::<DriveStatus>::try_from(v).ok()).unwrap_or_default();
+        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress, drives }))
     }
 
-    /// Method calls (`sync_now`, `pause`, `resume`).
+    /// Method calls (`sync_now`, `pause`, `resume`, drive management).
     pub fn daemon(&self) -> &OneDriveProxy<'static> {
         &self.proxy
     }

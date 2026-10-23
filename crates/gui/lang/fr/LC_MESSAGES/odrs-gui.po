@@ -94,3 +94,54 @@ msgid "{n} hour ago"
 msgid_plural "{n} hours ago"
 msgstr[0] "il y a {n} heure"
 msgstr[1] "il y a {n} heures"
+
+msgid "Synchronising… {} items checked, {} downloaded, {} uploaded"
+msgstr "Synchronisation… {} éléments vérifiés, {} téléchargés, {} envoyés"
+
+msgid "Waiting for its first pass"
+msgstr "En attente de sa première passe"
+
+msgid "Up to date, last sync {}"
+msgstr "À jour, dernière synchro {}"
+
+msgid "Open"
+msgstr "Ouvrir"
+
+msgid "Confirm removal"
+msgstr "Confirmer le retrait"
+
+msgid "Remove"
+msgstr "Retirer"
+
+msgid "Add a library…"
+msgstr "Ajouter une bibliothèque…"
+
+msgid "Add a SharePoint library"
+msgstr "Ajouter une bibliothèque SharePoint"
+
+msgid "1. Find the SharePoint site"
+msgstr "1. Trouver le site SharePoint"
+
+msgid "Site name (leave empty for all sites)"
+msgstr "Nom du site (vide : tous les sites)"
+
+msgid "Search"
+msgstr "Rechercher"
+
+msgid "2. Choose the library"
+msgstr "2. Choisir la bibliothèque"
+
+msgid "3. Name and local folder"
+msgstr "3. Nom et dossier local"
+
+msgid "Name"
+msgstr "Nom"
+
+msgid "Cancel"
+msgstr "Annuler"
+
+msgid "Add"
+msgstr "Ajouter"
+
+msgid "No site found"
+msgstr "Aucun site trouvé"
