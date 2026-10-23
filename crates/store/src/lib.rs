@@ -132,6 +132,21 @@ impl Store {
         Self::init(Connection::open(path)?)
     }
 
+    /// Consistent copy of another item database (e.g. the D client's) into
+    /// `dest`, with SQLite's online backup. Fails if `src` is locked by a running
+    /// D client (it uses `locking_mode = EXCLUSIVE`) or has another schema version.
+    pub fn import(src: &Path, dest: &Path) -> Result<Self> {
+        let source = Connection::open_with_flags(src, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i32 = source.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(Error::SchemaVersion(version));
+        }
+        let mut target = Connection::open(dest)?;
+        rusqlite::backup::Backup::new(&source, &mut target)?.run_to_completion(1024, std::time::Duration::ZERO, None)?;
+        drop(target);
+        Self::open(dest)
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -383,6 +398,20 @@ mod tests {
         assert!(s.get("D", "R").unwrap().is_none());
         s.begin().unwrap();
         s.commit().unwrap();
+    }
+
+    #[test]
+    fn import_copies_a_database() {
+        let dir = std::env::temp_dir().join(format!("odrs-import-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, dest) = (dir.join("src.sqlite3"), dir.join("dest.sqlite3"));
+        let s = Store::open(&src).unwrap();
+        s.upsert(&item("R", "root", ItemType::Root, None)).unwrap();
+        s.set_delta_link("D", "R", Some("cursor")).unwrap();
+        drop(s);
+        let imported = Store::import(&src, &dest).unwrap();
+        assert_eq!(imported.delta_link("D", "R").unwrap().as_deref(), Some("cursor"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

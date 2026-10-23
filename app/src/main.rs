@@ -11,6 +11,7 @@ use odrs_store::Store;
 
 mod config;
 mod daemon;
+mod import;
 
 #[derive(Parser)]
 #[command(name = "onedrive-rs", version, about = "Microsoft OneDrive client for Linux")]
@@ -73,6 +74,16 @@ enum Command {
         /// Seconds between two sync passes [config: monitor_interval; default 300].
         #[arg(long)]
         interval: Option<u64>,
+    },
+    /// Take over a D client installation (database, sync cursor and sync folder)
+    /// without downloading anything again. Stop the D client first.
+    ImportD {
+        /// D client configuration directory.
+        #[arg(long, default_value = "~/.config/onedrive")]
+        from: String,
+        /// Replace an existing onedrive-rs database (kept as a .bak file).
+        #[arg(long)]
+        force: bool,
     },
     /// Ask the running daemon to sync now.
     SyncNow,
@@ -237,6 +248,7 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
             daemon::run(&paths, auth, opts, mode, interval).await
         }
+        Command::ImportD { from, force } => import::run(&paths, auth, config::expand_home(&from), force).await,
         Command::SyncNow | Command::Pause | Command::Resume => {
             let client = odrs_ipc::Client::new().await?;
             if !client.is_running().await? {
