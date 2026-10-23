@@ -17,6 +17,8 @@ use crate::types::{DELTA_SELECT, DeltaPage, Drive, DriveItem};
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const USER_AGENT: &str = concat!("ISV|onedrive-rs|onedrive-rs/", env!("CARGO_PKG_VERSION"));
 const MAX_ATTEMPTS: u32 = 8;
+/// Throttling (429/503) is retried for this long before giving up.
+const MAX_THROTTLED: Duration = Duration::from_secs(3600);
 /// Refresh the access token when it expires within this margin.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(300);
 
@@ -34,6 +36,8 @@ pub struct Graph {
     store: TokenStore,
     tokens: Mutex<Option<Tokens>>,
     prefer_add_to_onedrive: AtomicBool,
+    /// When Graph throttles one request, every request waits until this instant.
+    throttled_until: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Graph {
@@ -42,7 +46,10 @@ impl Graph {
         if store.load()?.is_none() {
             return Err(Error::NotLoggedIn);
         }
-        Ok(Self { http, cfg, store, tokens: Mutex::new(None), prefer_add_to_onedrive: AtomicBool::new(false) })
+        Ok(Self { http, cfg, store, tokens: Mutex::new(None),
+            prefer_add_to_onedrive: AtomicBool::new(false),
+            throttled_until: std::sync::Mutex::new(None),
+        })
     }
 
     /// Persist tokens obtained from an interactive login.
@@ -77,12 +84,36 @@ impl Graph {
         Ok(access)
     }
 
+    /// Sleep while a throttling window announced by Graph is in effect.
+    async fn wait_throttle(&self) {
+        loop {
+            let until = *self.throttled_until.lock().unwrap();
+            match until {
+                Some(t) if t > Instant::now() => tokio::time::sleep_until(t.into()).await,
+                _ => return,
+            }
+        }
+    }
+
+    fn throttle(&self, delay: Duration) {
+        let until = Instant::now() + delay;
+        let mut guard = self.throttled_until.lock().unwrap();
+        if guard.is_none_or(|t| t < until) {
+            *guard = Some(until);
+        }
+    }
+
     /// Send an authenticated request, retrying on throttling, transient server
     /// errors and network failures. Non-success statuses become [`Error::Status`].
+    ///
+    /// 429/503 pause *all* requests of this client for `Retry-After` and are
+    /// retried for up to [`MAX_THROTTLED`]; other failures up to [`MAX_ATTEMPTS`] times.
     async fn send(&self, method: Method, url: &str, build: impl Fn(RequestBuilder) -> RequestBuilder) -> Result<Response> {
         let mut attempt = 0;
         let mut force_refresh = false;
+        let started = Instant::now();
         loop {
+            self.wait_throttle().await;
             attempt += 1;
             let token = self.access_token(force_refresh).await?;
             force_refresh = false;
@@ -98,8 +129,10 @@ impl Graph {
                         force_refresh = true;
                         continue;
                     }
-                    let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
-                    if !retryable || attempt >= MAX_ATTEMPTS {
+                    let throttled = matches!(status.as_u16(), 429 | 503);
+                    let retryable = throttled || matches!(status.as_u16(), 408 | 500 | 502 | 504);
+                    let exhausted = if throttled { started.elapsed() > MAX_THROTTLED } else { attempt >= MAX_ATTEMPTS };
+                    if !retryable || exhausted {
                         let body = resp.text().await.unwrap_or_default();
                         return Err(Error::Status { status: status.as_u16(), url: url.to_owned(), body });
                     }
@@ -109,8 +142,14 @@ impl Graph {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.trim().parse::<u64>().ok())
                         .map(Duration::from_secs);
-                    tracing::warn!(%status, url, attempt, ?retry_after, "Graph request throttled or failed, retrying");
-                    retry_after.unwrap_or_else(|| backoff(attempt))
+                    let delay = retry_after.unwrap_or_else(|| backoff(attempt));
+                    if throttled {
+                        tracing::warn!(%status, attempt, ?delay, "Graph is throttling, pausing all requests");
+                        self.throttle(delay);
+                        continue;
+                    }
+                    tracing::warn!(%status, url, attempt, "Graph request failed, retrying");
+                    delay
                 }
                 Err(e) if attempt < MAX_ATTEMPTS && (e.is_timeout() || e.is_connect() || e.is_request()) => {
                     tracing::warn!(error = %e, url, attempt, "network error, retrying");
