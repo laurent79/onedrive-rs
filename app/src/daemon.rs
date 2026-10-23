@@ -1,5 +1,6 @@
 //! `onedrive-rs daemon`: periodic sync passes, controlled over D-Bus.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -15,6 +16,8 @@ use tokio::sync::mpsc;
 use crate::Paths;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+/// Quiet time after a local change before starting a pass.
+const DEBOUNCE: Duration = Duration::from_secs(5);
 
 pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncMode, interval: Duration) -> Result<()> {
     let _lock = crate::lock(paths)?;
@@ -34,6 +37,18 @@ pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncM
     let server = Server::start(info, tx).await.context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
     tracing::info!(interval = ?interval, ?mode, sync_dir = %sync_dir.display(), "daemon started");
 
+    // Local changes only matter when they are uploaded.
+    let (_watcher, mut local_rx) = if mode == SyncMode::Bidirectional {
+        let skip = opts.skip_file.clone();
+        let relevant: odrs_watch::Filter = Box::new(move |p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !skip.matches(n))
+        });
+        let (w, rx) = odrs_watch::Watcher::new(&sync_dir, relevant).context("cannot watch the sync folder")?;
+        (Some(w), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut paused = false;
     let mut next = Instant::now();
@@ -42,6 +57,11 @@ pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncM
         let wake = tokio::time::sleep_until(next.into());
         tokio::select! {
             _ = wake, if !paused => {}
+            Some(path) = local_change(&mut local_rx) => {
+                tracing::debug!(path = %path.display(), "local change");
+                next = next.min(Instant::now() + DEBOUNCE);
+                continue;
+            }
             cmd = rx.recv() => {
                 match cmd {
                     Some(Command::SyncNow) if !paused => next = Instant::now(),
@@ -111,6 +131,14 @@ pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncM
     }
     tracing::info!("daemon stopping");
     Ok(())
+}
+
+/// Next local change, or never when not watching.
+async fn local_change(rx: &mut Option<mpsc::UnboundedReceiver<PathBuf>>) -> Option<PathBuf> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Resolves when a `Pause` command arrives; other commands are ignored while a pass runs.

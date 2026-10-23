@@ -1,0 +1,13 @@
+[package]
+name = "odrs-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+notify = "8.2.0"
+tokio = { version = "1.54.1", features = ["sync"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
