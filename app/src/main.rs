@@ -9,6 +9,8 @@ use odrs_engine::{Stats, SyncOptions};
 use odrs_graph::{AuthConfig, Graph, LoopbackLogin, ManualLogin, TokenStore};
 use odrs_store::Store;
 
+mod daemon;
+
 #[derive(Parser)]
 #[command(name = "onedrive-rs", version, about = "Microsoft OneDrive client for Linux")]
 struct Cli {
@@ -63,8 +65,24 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Run as a background service (not implemented yet).
-    Daemon,
+    /// Run as a background service: periodic sync passes, controlled over D-Bus.
+    Daemon {
+        /// Local folder to synchronise.
+        #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
+        sync_dir: Option<PathBuf>,
+        /// Maximum concurrent downloads.
+        #[arg(long, default_value_t = 8)]
+        transfers: usize,
+        /// Seconds between two sync passes.
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+    },
+    /// Ask the running daemon to sync now.
+    SyncNow,
+    /// Pause the running daemon (cancels the current pass).
+    Pause,
+    /// Resume the running daemon.
+    Resume,
     /// Open the graphical interface (not implemented yet).
     Gui,
 }
@@ -134,7 +152,23 @@ async fn main() -> Result<()> {
             };
             verify(&db.unwrap_or_else(|| paths.db()), &dir, limit)
         }
-        Command::Daemon | Command::Gui => bail!("not implemented yet"),
+        Command::Daemon { sync_dir, transfers, interval } => {
+            let sync_dir = match sync_dir {
+                Some(d) => d,
+                None => default_sync_dir()?,
+            };
+            daemon::run(&paths, auth, sync_dir, transfers, Duration::from_secs(interval)).await
+        }
+        Command::SyncNow | Command::Pause | Command::Resume => {
+            let proxy = odrs_ipc::connect().await?.context("the daemon is not running")?;
+            match cli.command {
+                Command::SyncNow => proxy.sync_now().await?,
+                Command::Pause => proxy.pause().await?,
+                _ => proxy.resume().await?,
+            }
+            Ok(())
+        }
+        Command::Gui => bail!("not implemented yet"),
     }
 }
 
@@ -227,6 +261,49 @@ fn print_stats(s: &Stats, started: Instant, label: &str) {
 
 async fn status(paths: &Paths, auth: AuthConfig) -> Result<()> {
     println!("Config dir: {}", paths.config_dir.display());
+    // While the daemon runs it owns the tokens: ask it instead of refreshing them here.
+    let daemon = match odrs_ipc::connect().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(error = %e, "no session bus");
+            None
+        }
+    };
+    if let Some(d) = daemon {
+        let p = d.progress().await?;
+        println!("Daemon:     {} (sync dir {})", d.state().await?, d.sync_dir().await?);
+        println!("Account:    {}", d.account().await?);
+        println!("Last sync:  {}", Some(d.last_sync().await?).filter(|s| !s.is_empty()).unwrap_or_else(|| "never".into()));
+        let err = d.last_error().await?;
+        if !err.is_empty() {
+            println!("Last error: {err}");
+        }
+        println!(
+            "Last pass:  {} items, {} downloaded ({:.1} MiB), {} unchanged, {} deleted, {} skipped, {} errors",
+            p.items,
+            p.downloaded,
+            p.bytes as f64 / (1024.0 * 1024.0),
+            p.unchanged,
+            p.deleted,
+            p.skipped,
+            p.errors
+        );
+    } else {
+        println!("Daemon:     not running");
+        account_status(auth, paths).await?;
+    }
+    if paths.db().exists() {
+        let store = Store::open(&paths.db())?;
+        for (t, n) in store.count_by_type()? {
+            println!("DB items:   {t:<6} {n}");
+        }
+    } else {
+        println!("Database:   none yet");
+    }
+    Ok(())
+}
+
+async fn account_status(auth: AuthConfig, paths: &Paths) -> Result<()> {
     match Graph::new(odrs_graph::http_client()?, auth, paths.token_store()) {
         Ok(graph) => {
             let drive = graph.me_drive().await?;
@@ -239,14 +316,6 @@ async fn status(paths: &Paths, auth: AuthConfig) -> Result<()> {
         }
         Err(odrs_graph::Error::NotLoggedIn) => println!("Account:    not logged in"),
         Err(e) => return Err(e.into()),
-    }
-    if paths.db().exists() {
-        let store = Store::open(&paths.db())?;
-        for (t, n) in store.count_by_type()? {
-            println!("DB items:   {t:<6} {n}");
-        }
-    } else {
-        println!("Database:   none yet");
     }
     Ok(())
 }

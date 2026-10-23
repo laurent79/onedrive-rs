@@ -166,6 +166,15 @@ impl Store {
         Ok(())
     }
 
+    /// Roll back a transaction left open by an interrupted pass (e.g. a
+    /// cancelled future), so the next `begin` does not fail.
+    pub fn abort_open_transaction(&self) -> Result<()> {
+        if !self.conn.is_autocommit() {
+            self.conn.execute_batch("ROLLBACK")?;
+        }
+        Ok(())
+    }
+
     pub fn rollback(&self) -> Result<()> {
         self.conn.execute_batch("ROLLBACK")?;
         Ok(())
@@ -350,6 +359,18 @@ mod tests {
         s.delete("D", "A").unwrap();
         assert!(s.get("D", "F").unwrap().is_none());
         assert_eq!(s.children("D", "R").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn abort_open_transaction() {
+        let s = Store::open_in_memory().unwrap();
+        s.abort_open_transaction().unwrap(); // no-op outside a transaction
+        s.begin().unwrap();
+        s.upsert(&item("R", "root", ItemType::Root, None)).unwrap();
+        s.abort_open_transaction().unwrap();
+        assert!(s.get("D", "R").unwrap().is_none());
+        s.begin().unwrap();
+        s.commit().unwrap();
     }
 
     #[test]

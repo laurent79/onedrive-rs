@@ -44,6 +44,7 @@ impl<'a> DownloadSync<'a> {
     }
 
     pub async fn run(mut self) -> Result<(), Error> {
+        self.store.abort_open_transaction()?;
         std::fs::create_dir_all(&self.opts.sync_dir)?;
         let drive = self.graph.me_drive().await?;
         self.graph.set_prefer_add_to_onedrive(drive.is_personal());
