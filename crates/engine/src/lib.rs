@@ -54,8 +54,8 @@ pub struct SyncOptions {
     pub max_transfers: usize,
     /// Used in safeBackup file names.
     pub device_name: String,
-    /// Local names never uploaded (D: `skip_file`).
-    pub skip_file: filter::SkipList,
+    /// Client-side filtering (D: `skip_file`, `skip_dir`, `skip_dotfiles`), both directions.
+    pub filters: filter::Filters,
     /// Refuse online deletions of more items than this in one pass (D: `classify_as_big_delete`).
     pub big_delete_threshold: u64,
     /// Report what would be done without changing anything (online or local).
@@ -72,7 +72,7 @@ impl SyncOptions {
             sync_dir,
             max_transfers: 8,
             device_name: local::device_name(),
-            skip_file: filter::SkipList::default(),
+            filters: filter::Filters::default(),
             big_delete_threshold: 1000,
             dry_run: false,
             dir_mode: 0o700,

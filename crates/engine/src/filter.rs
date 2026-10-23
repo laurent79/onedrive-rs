@@ -51,6 +51,54 @@ impl Default for SkipList {
     }
 }
 
+/// D's `skip_dir`: an entry without `/` skips every directory of that name,
+/// an entry with `/` skips that exact path (relative to the sync dir).
+/// Case-insensitive, `*`/`?` wildcards, `|` separated.
+#[derive(Debug, Clone, Default)]
+pub struct SkipDirs {
+    names: Vec<Vec<char>>,
+    paths: Vec<Vec<char>>,
+}
+
+impl SkipDirs {
+    pub fn new(spec: &str) -> Self {
+        let mut out = Self::default();
+        for p in spec.split('|').map(str::trim).filter(|p| !p.is_empty()) {
+            let p = p.trim_matches('/').to_lowercase();
+            if p.contains('/') {
+                out.paths.push(p.chars().collect());
+            } else {
+                out.names.push(p.chars().collect());
+            }
+        }
+        out
+    }
+
+    /// `rel` is the directory path relative to the sync dir, `/`-separated.
+    pub fn matches(&self, name: &str, rel: &str) -> bool {
+        let name: Vec<char> = name.to_lowercase().chars().collect();
+        let rel: Vec<char> = rel.trim_matches('/').to_lowercase().chars().collect();
+        self.names.iter().any(|p| glob(p, &name)) || self.paths.iter().any(|p| glob(p, &rel))
+    }
+}
+
+/// Client-side filtering rules applied in both directions (as the D client).
+#[derive(Debug, Clone, Default)]
+pub struct Filters {
+    pub skip_file: SkipList,
+    pub skip_dir: SkipDirs,
+    pub skip_dotfiles: bool,
+}
+
+impl Filters {
+    pub fn excludes(&self, name: &str, rel: &str, is_dir: bool) -> bool {
+        if self.skip_dotfiles && name.starts_with('.') {
+            return true;
+        }
+        if is_dir { self.skip_dir.matches(name, rel) } else { self.skip_file.matches(name) }
+    }
+}
+
 /// Iterative wildcard match (`*` any run, `?` one char).
 fn glob(pattern: &[char], text: &[char]) -> bool {
     let (mut p, mut t) = (0, 0);
@@ -89,6 +137,20 @@ mod tests {
         assert!(!is_valid_onedrive_name("trailing."));
         assert!(!is_valid_onedrive_name(" leading"));
         assert!(!is_valid_onedrive_name("Desktop.ini"));
+    }
+
+    #[test]
+    fn skip_dirs() {
+        let d = SkipDirs::new("node_modules|/Documents/Visual Studio*|.cache");
+        assert!(d.matches("node_modules", "a/b/node_modules"));
+        assert!(d.matches("Visual Studio 2022", "Documents/Visual Studio 2022"));
+        assert!(!d.matches("Visual Studio 2022", "Other/Visual Studio 2022"));
+        assert!(d.matches(".Cache", ".Cache"));
+        assert!(!d.matches("src", "src"));
+        let f = Filters { skip_dotfiles: true, ..Default::default() };
+        assert!(f.excludes(".git", ".git", true));
+        assert!(f.excludes("x.partial", "x.partial", false));
+        assert!(!f.excludes("notes.txt", "notes.txt", false));
     }
 
     #[test]

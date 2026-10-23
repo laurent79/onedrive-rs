@@ -9,6 +9,7 @@ use odrs_engine::{Stats, SyncOptions};
 use odrs_graph::{AuthConfig, Graph, LoopbackLogin, ManualLogin, TokenStore};
 use odrs_store::Store;
 
+mod config;
 mod daemon;
 
 #[derive(Parser)]
@@ -17,9 +18,9 @@ struct Cli {
     /// Configuration directory (refresh token, database).
     #[arg(long, global = true, env = "ONEDRIVE_RS_CONFIG_DIR")]
     config_dir: Option<PathBuf>,
-    /// Entra application (client) ID.
-    #[arg(long, global = true, default_value = odrs_graph::auth::DEFAULT_CLIENT_ID)]
-    client_id: String,
+    /// Entra application (client) ID [config: application_id; default: the D client's public app].
+    #[arg(long, global = true)]
+    client_id: Option<String>,
     /// More logging (-v debug, -vv trace).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -40,21 +41,15 @@ enum Command {
     },
     /// Run one synchronisation pass.
     Sync {
-        #[arg(long, value_enum, default_value_t = Mode::Bidirectional)]
-        mode: Mode,
-        /// Kept for compatibility: same as `--mode download-only`.
-        #[arg(long, hide = true)]
+        #[command(flatten)]
+        args: SyncArgs,
+        /// Same as `--mode download-only`.
+        #[arg(long)]
         download_only: bool,
         /// Report what would be uploaded/deleted online without changing anything
         /// (online changes are not fetched).
         #[arg(long)]
         dry_run: bool,
-        /// Local folder to synchronise.
-        #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
-        sync_dir: Option<PathBuf>,
-        /// Maximum concurrent downloads.
-        #[arg(long, default_value_t = 8)]
-        transfers: usize,
     },
     /// Show account and database status.
     Status,
@@ -73,17 +68,11 @@ enum Command {
     },
     /// Run as a background service: periodic sync passes, controlled over D-Bus.
     Daemon {
-        #[arg(long, value_enum, default_value_t = Mode::Bidirectional)]
-        mode: Mode,
-        /// Local folder to synchronise.
-        #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
-        sync_dir: Option<PathBuf>,
-        /// Maximum concurrent downloads.
-        #[arg(long, default_value_t = 8)]
-        transfers: usize,
-        /// Seconds between two sync passes.
-        #[arg(long, default_value_t = 300)]
-        interval: u64,
+        #[command(flatten)]
+        args: SyncArgs,
+        /// Seconds between two sync passes [config: monitor_interval; default 300].
+        #[arg(long)]
+        interval: Option<u64>,
     },
     /// Ask the running daemon to sync now.
     SyncNow,
@@ -97,6 +86,35 @@ enum Command {
         #[arg(long)]
         hidden: bool,
     },
+}
+
+/// Options shared by `sync` and `daemon`; unset ones come from the config file.
+#[derive(clap::Args)]
+struct SyncArgs {
+    /// Sync direction [config: download_only; default: bidirectional].
+    #[arg(long, value_enum)]
+    mode: Option<Mode>,
+    /// Local folder to synchronise [config: sync_dir; default: ~/OneDrive-rs].
+    #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
+    sync_dir: Option<PathBuf>,
+    /// Maximum concurrent transfers [config: threads; default 8].
+    #[arg(long)]
+    transfers: Option<usize>,
+}
+
+impl SyncArgs {
+    fn resolve(self, cfg: &config::Config) -> Result<(SyncOptions, odrs_engine::SyncMode)> {
+        let sync_dir = match self.sync_dir.or_else(|| cfg.sync_dir.clone()) {
+            Some(d) => d,
+            None => default_sync_dir()?,
+        };
+        let mut opts = cfg.sync_options(sync_dir);
+        if let Some(t) = self.transfers {
+            opts.max_transfers = t;
+        }
+        let mode = self.mode.unwrap_or(if cfg.download_only == Some(true) { Mode::DownloadOnly } else { Mode::Bidirectional });
+        Ok((opts, mode.into()))
+    }
 }
 
 /// Sync direction.
@@ -135,6 +153,9 @@ impl Paths {
     fn db(&self) -> PathBuf {
         self.config_dir.join("items.sqlite3")
     }
+    fn config(&self) -> PathBuf {
+        self.config_dir.join("config")
+    }
     fn lock(&self) -> PathBuf {
         self.config_dir.join("lock")
     }
@@ -160,14 +181,19 @@ fn main() -> Result<()> {
         .init();
 
     let paths = Paths::new(cli.config_dir)?;
-    let auth = AuthConfig { client_id: cli.client_id, read_only: false };
+    let cfg = config::Config::load(&paths.config())?;
+    let client_id = cli
+        .client_id
+        .or_else(|| cfg.application_id.clone())
+        .unwrap_or_else(|| odrs_graph::auth::DEFAULT_CLIENT_ID.to_owned());
+    let auth = AuthConfig { client_id, read_only: false };
     let rt = tokio::runtime::Runtime::new()?;
     if let Command::Gui { hidden } = cli.command {
         // The UI event loop owns this thread; async D-Bus work runs on the runtime's workers.
         let opts = odrs_gui::Options { hidden, start_daemon: Box::new(spawn_daemon) };
         return Ok(odrs_gui::run(rt.handle().clone(), opts)?);
     }
-    rt.block_on(run(cli.command, paths, auth))
+    rt.block_on(run(cli.command, paths, cfg, auth))
 }
 
 /// Start `onedrive-rs daemon` detached from the GUI, logging to the XDG state dir.
@@ -187,34 +213,29 @@ fn spawn_daemon() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn run(command: Command, paths: Paths, auth: AuthConfig) -> Result<()> {
+async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConfig) -> Result<()> {
     match command {
         Command::Login { manual, read_only } => login(&paths, AuthConfig { read_only, ..auth }, manual).await,
-        Command::Sync { mode, download_only, dry_run, sync_dir, transfers } => {
-            let mode = if download_only { Mode::DownloadOnly } else { mode };
-            let mut opts = SyncOptions::new(match sync_dir {
-                Some(d) => d,
-                None => default_sync_dir()?,
-            });
-            opts.max_transfers = transfers;
+        Command::Sync { mut args, download_only, dry_run } => {
+            if download_only {
+                args.mode = Some(Mode::DownloadOnly);
+            }
+            let (mut opts, mode) = args.resolve(&cfg)?;
             opts.dry_run = dry_run;
-            sync(&paths, auth, opts, mode.into()).await
+            sync(&paths, auth, opts, mode).await
         }
         Command::Status => status(&paths, auth).await,
         Command::Verify { db, dir, limit } => {
-            let dir = match dir {
+            let dir = match dir.or_else(|| cfg.sync_dir.clone()) {
                 Some(d) => d,
                 None => default_sync_dir()?,
             };
             verify(&db.unwrap_or_else(|| paths.db()), &dir, limit)
         }
-        Command::Daemon { mode, sync_dir, transfers, interval } => {
-            let mut opts = SyncOptions::new(match sync_dir {
-                Some(d) => d,
-                None => default_sync_dir()?,
-            });
-            opts.max_transfers = transfers;
-            daemon::run(&paths, auth, opts, mode.into(), Duration::from_secs(interval)).await
+        Command::Daemon { args, interval } => {
+            let (opts, mode) = args.resolve(&cfg)?;
+            let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
+            daemon::run(&paths, auth, opts, mode, interval).await
         }
         Command::SyncNow | Command::Pause | Command::Resume => {
             let client = odrs_ipc::Client::new().await?;
@@ -234,6 +255,7 @@ async fn run(command: Command, paths: Paths, auth: AuthConfig) -> Result<()> {
 
 async fn login(paths: &Paths, auth: AuthConfig, manual: bool) -> Result<()> {
     let http = odrs_graph::http_client()?;
+    let client_id = auth.client_id.clone();
     let tokens = if manual {
         let flow = ManualLogin::new(auth);
         eprintln!("Open this URL in a browser, sign in, then paste the URL of the blank page you land on:\n\n{}\n", flow.url());
@@ -252,7 +274,7 @@ async fn login(paths: &Paths, auth: AuthConfig, manual: bool) -> Result<()> {
         }
     };
     Graph::save_login(&paths.token_store(), &tokens)?;
-    let graph = Graph::new(http, AuthConfig::default(), paths.token_store())?;
+    let graph = Graph::new(http, AuthConfig { client_id, read_only: false }, paths.token_store())?;
     match graph.me_drive().await {
         Ok(drive) => {
             let who = drive.owner.and_then(|o| o.user).and_then(|u| u.email.or(u.display_name)).unwrap_or_default();

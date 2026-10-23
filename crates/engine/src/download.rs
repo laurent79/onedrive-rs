@@ -155,14 +155,14 @@ impl<'a> DownloadSync<'a> {
         if !is_safe_name(name) {
             return Err(Error::InvalidItem(item.id.clone(), "unusable file name"));
         }
-        // Like the D client, skip_file applies to downloads as well as uploads.
-        if item.is_file() && self.opts.skip_file.matches(name) {
-            tracing::debug!(id = %item.id, name, "skip_file match, not downloading");
+        let rel = if parent_rel.is_empty() { name.to_owned() } else { format!("{parent_rel}/{name}") };
+        // Like the D client, filters apply to downloads as well as uploads.
+        if self.opts.filters.excludes(name, &rel, item.is_folder()) {
+            tracing::debug!(path = %rel, "excluded by skip_file/skip_dir/skip_dotfiles");
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let db = to_db_item(item, &self.drive_id)?;
-        let rel = if parent_rel.is_empty() { name.to_owned() } else { format!("{parent_rel}/{name}") };
 
         if self.in_flight.contains(&db.id) {
             self.drain().await?;

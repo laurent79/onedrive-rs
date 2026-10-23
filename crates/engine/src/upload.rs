@@ -118,8 +118,9 @@ impl<'a> UploadSync<'a> {
         new.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, state) in new {
             let child_rel = Self::join(rel, &name);
-            if self.opts.skip_file.matches(&name) || !is_valid_onedrive_name(&name) {
-                tracing::debug!(path = %child_rel, "not uploading (skip_file or invalid OneDrive name)");
+            let is_dir = state == LocalState::Dir;
+            if self.opts.filters.excludes(&name, &child_rel, is_dir) || !is_valid_onedrive_name(&name) {
+                tracing::debug!(path = %child_rel, "not uploading (excluded or invalid OneDrive name)");
                 self.stats.skipped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -187,10 +188,11 @@ impl<'a> UploadSync<'a> {
         for entry in std::fs::read_dir(self.local_path(rel))? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if self.opts.skip_file.matches(&name) || !is_valid_onedrive_name(&name) {
+            let state = local::stat(&entry.path())?;
+            if self.opts.filters.excludes(&name, &Self::join(rel, &name), state == LocalState::Dir) || !is_valid_onedrive_name(&name) {
                 continue;
             }
-            match local::stat(&entry.path())? {
+            match state {
                 LocalState::Dir => {
                     self.stats.folders_created_online.fetch_add(1, Ordering::Relaxed);
                     self.count_new_tree(&Self::join(rel, &name))?;

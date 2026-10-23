@@ -39,7 +39,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncM
 
     // Local changes only matter when they are uploaded.
     let (_watcher, mut local_rx) = if mode == SyncMode::Bidirectional {
-        let skip = opts.skip_file.clone();
+        let skip = opts.filters.skip_file.clone();
         let relevant: odrs_watch::Filter = Box::new(move |p| {
             p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !skip.matches(n))
         });
