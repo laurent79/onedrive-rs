@@ -74,6 +74,14 @@ impl Graph {
         }
     }
 
+    /// Move and/or rename an item; fails with HTTP 409 if the target name exists.
+    pub async fn move_item(&self, drive_id: &str, item_id: &str, new_parent_id: &str, new_name: &str) -> Result<DriveItem> {
+        let url = format!("{GRAPH_BASE}/drives/{drive_id}/items/{item_id}?@microsoft.graph.conflictBehavior=fail");
+        let body = serde_json::json!({ "name": new_name, "parentReference": { "id": new_parent_id } });
+        let resp = self.send(Method::PATCH, &url, |r| Ok(r.json(&body))).await?;
+        Ok(serde_json::from_slice(&resp.bytes().await?)?)
+    }
+
     /// Delete an item (folders recursively, into the online recycle bin).
     /// Already deleted is success; a changed item (`if_match` mismatch) is HTTP 412.
     pub async fn delete_item(&self, drive_id: &str, item_id: &str, if_match: Option<&str>) -> Result<()> {

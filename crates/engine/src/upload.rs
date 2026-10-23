@@ -8,8 +8,11 @@
 //! id); file uploads run concurrently (bounded) and are recorded by the main
 //! task, which alone owns the database. Online deletions are collected during
 //! the walk and only applied afterwards, if they stay under the big-delete limit.
+//!
+//! Before the walk, local moves/renames are detected (see [`crate::moves`]) and
+//! applied online as single moves, so they are neither re-uploaded nor deleted.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -23,6 +26,7 @@ use crate::convert::{format_db_time, parse_graph_time, to_db_item};
 use crate::decide::{LocalChange, local_change_with_hash, local_change_without_hash};
 use crate::filter::is_valid_onedrive_name;
 use crate::local::{self, LocalState};
+use crate::moves::{self, Missing, NewDir, NewFile, is_within};
 use crate::{Error, Stats, SyncOptions};
 
 enum Outcome {
@@ -45,11 +49,25 @@ pub struct UploadSync<'a> {
     tasks: JoinSet<Uploaded>,
     /// Tracked items missing locally: (item, path), deleted online after the walk.
     deletions: Vec<(Item, String)>,
+    /// Dry run only: detected moves (old and new paths) the walk must not report again.
+    moved_old: HashSet<String>,
+    moved_new: Vec<String>,
+    root_drive: Option<String>,
 }
 
 impl<'a> UploadSync<'a> {
     pub fn new(graph: Arc<Graph>, store: &'a Store, opts: SyncOptions, stats: Arc<Stats>) -> Self {
-        Self { graph, store, opts, stats, tasks: JoinSet::new(), deletions: Vec::new() }
+        Self {
+            graph,
+            store,
+            opts,
+            stats,
+            tasks: JoinSet::new(),
+            deletions: Vec::new(),
+            moved_old: HashSet::new(),
+            moved_new: Vec::new(),
+            root_drive: None,
+        }
     }
 
     pub async fn run(mut self, drive_id: &str) -> Result<(), Error> {
@@ -62,6 +80,18 @@ impl<'a> UploadSync<'a> {
         if self.opts.dry_run {
             tracing::info!("dry run: no change will be made online or locally");
         }
+        self.root_drive = Some(root.drive_id.clone());
+        self.store.begin()?;
+        let moved = self.apply_moves(&root).await;
+        self.store.commit()?;
+        if let Err(e) = moved {
+            if e.is_fatal() {
+                return Err(e);
+            }
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(error = %e, "move detection failed; moves will be handled as upload + delete");
+        }
+
         let mut stack = vec![(root, String::new())];
         while let Some((dir, rel)) = stack.pop() {
             self.store.begin()?;
@@ -104,6 +134,7 @@ impl<'a> UploadSync<'a> {
         for child in self.store.children(&dir.drive_id, &dir.id)? {
             let child_rel = Self::join(rel, &child.name);
             match (child.item_type, local.remove(&child.name)) {
+                (_, None | Some(LocalState::Absent)) if self.moved_old.contains(&child_rel) => {}
                 (_, None | Some(LocalState::Absent)) => self.deletions.push((child, child_rel)),
                 (ItemType::Dir, Some(LocalState::Dir)) => stack.push((child, child_rel)),
                 (ItemType::File, Some(LocalState::File { size, mtime })) => self.tracked_file(child, child_rel, size, mtime).await?,
@@ -118,6 +149,9 @@ impl<'a> UploadSync<'a> {
         new.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, state) in new {
             let child_rel = Self::join(rel, &name);
+            if self.moved_new.iter().any(|d| is_within(&child_rel, d)) {
+                continue;
+            }
             let is_dir = state == LocalState::Dir;
             if self.opts.filters.excludes(&name, &child_rel, is_dir) || !is_valid_onedrive_name(&name) {
                 tracing::debug!(path = %child_rel, "not uploading (excluded or invalid OneDrive name)");
@@ -141,6 +175,144 @@ impl<'a> UploadSync<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Local entries worth a move check: valid names not excluded by filters.
+    fn local_entries(&self, rel: &str) -> Result<HashMap<String, LocalState>, Error> {
+        let mut out = HashMap::new();
+        for entry in std::fs::read_dir(self.local_path(rel))? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            let state = local::stat(&entry.path())?;
+            let excluded = self.opts.filters.excludes(&name, &Self::join(rel, &name), state == LocalState::Dir);
+            if !excluded && is_valid_onedrive_name(&name) {
+                out.insert(name, state);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whole-tree scan for tracked items missing locally and untracked local entries.
+    fn collect_changes(&self, root: &Item) -> Result<(Vec<Missing>, Vec<NewFile>, Vec<NewDir>), Error> {
+        let (mut missing, mut new_files, mut new_dirs) = (Vec::new(), Vec::new(), Vec::new());
+        // (tracked folder or None for a new one, path, index in new_dirs)
+        let mut stack: Vec<(Option<Item>, String, Option<usize>)> = vec![(Some(root.clone()), String::new(), None)];
+        while let Some((dir, rel, new_idx)) = stack.pop() {
+            let mut local = self.local_entries(&rel)?;
+            if let Some(i) = new_idx {
+                new_dirs[i] = NewDir { rel: rel.clone(), children: local.keys().cloned().collect() };
+            }
+            if let Some(dir) = dir {
+                for child in self.store.children(&dir.drive_id, &dir.id)? {
+                    let child_rel = Self::join(&rel, &child.name);
+                    match local.remove(&child.name) {
+                        None | Some(LocalState::Absent) => {
+                            let children: BTreeSet<String> = match child.item_type {
+                                ItemType::Dir => self.store.children(&child.drive_id, &child.id)?.into_iter().map(|c| c.name).collect(),
+                                _ => BTreeSet::new(),
+                            };
+                            let mtime = parse_graph_time(&child.mtime).map_or(0, OffsetDateTime::unix_timestamp);
+                            missing.push(Missing { item: child, rel: child_rel, children, mtime });
+                        }
+                        Some(LocalState::Dir) if child.item_type == ItemType::Dir => stack.push((Some(child), child_rel, None)),
+                        Some(_) => {}
+                    }
+                }
+            }
+            for (name, state) in local {
+                let child_rel = Self::join(&rel, &name);
+                match state {
+                    LocalState::Dir => {
+                        new_dirs.push(NewDir { rel: child_rel.clone(), children: BTreeSet::new() });
+                        stack.push((None, child_rel, Some(new_dirs.len() - 1)));
+                    }
+                    LocalState::File { size, mtime } => new_files.push(NewFile { rel: child_rel, size, mtime }),
+                    _ => {}
+                }
+            }
+        }
+        Ok((missing, new_files, new_dirs))
+    }
+
+    async fn apply_moves(&mut self, root: &Item) -> Result<(), Error> {
+        let (missing, new_files, new_dirs) = self.collect_changes(root)?;
+        if missing.is_empty() || (new_files.is_empty() && new_dirs.is_empty()) {
+            return Ok(());
+        }
+        // (item, old path, new path)
+        let mut found: Vec<(Item, String, String)> = Vec::new();
+        let dir_matches = moves::match_dirs(&missing, &new_dirs);
+        for &(m, n) in &dir_matches {
+            found.push((missing[m].item.clone(), missing[m].rel.clone(), new_dirs[n].rel.clone()));
+        }
+        // Files inside a moved folder move with it.
+        let moved_dirs: Vec<&str> = dir_matches.iter().map(|&(_, n)| new_dirs[n].rel.as_str()).collect();
+        let new_files: Vec<NewFile> = new_files.into_iter().filter(|f| !moved_dirs.iter().any(|d| is_within(&f.rel, d))).collect();
+        let mut used = HashSet::new();
+        for (m, candidates) in moves::file_candidates(&missing, &new_files) {
+            for c in candidates {
+                if used.contains(&c) {
+                    continue;
+                }
+                let hash = crate::download::hash_file(self.local_path(&new_files[c].rel)).await?;
+                if missing[m].item.quick_xor_hash.as_deref() == Some(hash.as_str()) {
+                    used.insert(c);
+                    found.push((missing[m].item.clone(), missing[m].rel.clone(), new_files[c].rel.clone()));
+                    break;
+                }
+            }
+        }
+        // Folders first, shallowest first.
+        found.sort_by_key(|(item, _, new)| (item.item_type != ItemType::Dir, new.matches('/').count()));
+        for (item, old_rel, new_rel) in found {
+            if let Err(e) = self.move_online(&item, &old_rel, &new_rel).await {
+                if e.is_fatal() {
+                    return Err(e);
+                }
+                // The walk falls back to upload + delete for this one.
+                tracing::warn!(from = %old_rel, to = %new_rel, error = %e, "online move failed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn move_online(&mut self, item: &Item, old_rel: &str, new_rel: &str) -> Result<(), Error> {
+        tracing::info!(from = %old_rel, to = %new_rel, kind = item.item_type.as_str(), dry_run = self.opts.dry_run, "moved locally, moving online");
+        if self.opts.dry_run {
+            self.stats.moved_online.fetch_add(1, Ordering::Relaxed);
+            self.moved_old.insert(old_rel.to_owned());
+            self.moved_new.push(new_rel.to_owned());
+            return Ok(());
+        }
+        let (parent_rel, name) = new_rel.rsplit_once('/').unwrap_or(("", new_rel));
+        let parent = self.ensure_online_dir(parent_rel).await?;
+        let moved = self.graph.move_item(&item.drive_id, &item.id, &parent.id, name).await?;
+        self.store.upsert(&to_db_item(&moved, &item.drive_id)?)?;
+        self.stats.moved_online.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The tracked folder at `rel`, creating missing levels online (move target inside a new folder).
+    async fn ensure_online_dir(&mut self, rel: &str) -> Result<Item, Error> {
+        let mut dir = self.store.root(&self.root_drive()?)?.ok_or(Error::InvalidItem(String::new(), "no root"))?;
+        for name in rel.split('/').filter(|n| !n.is_empty()) {
+            dir = match self.store.child_by_name(&dir.drive_id, &dir.id, name)? {
+                Some(child) if child.item_type == ItemType::Dir => child,
+                Some(_) => return Err(Error::Blocked(self.local_path(rel))),
+                None => {
+                    let created = self.graph.create_folder(&dir.drive_id, &dir.id, name).await?;
+                    let item = to_db_item(&created, &dir.drive_id)?;
+                    self.store.upsert(&item)?;
+                    self.stats.folders_created_online.fetch_add(1, Ordering::Relaxed);
+                    item
+                }
+            };
+        }
+        Ok(dir)
+    }
+
+    fn root_drive(&self) -> Result<String, Error> {
+        self.root_drive.clone().ok_or(Error::InvalidItem(String::new(), "no root"))
     }
 
     async fn tracked_file(&mut self, db: Item, rel: String, size: u64, mtime: i64) -> Result<(), Error> {
@@ -189,7 +361,11 @@ impl<'a> UploadSync<'a> {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let state = local::stat(&entry.path())?;
-            if self.opts.filters.excludes(&name, &Self::join(rel, &name), state == LocalState::Dir) || !is_valid_onedrive_name(&name) {
+            let child_rel = Self::join(rel, &name);
+            if self.opts.filters.excludes(&name, &child_rel, state == LocalState::Dir)
+                || !is_valid_onedrive_name(&name)
+                || self.moved_new.iter().any(|d| is_within(&child_rel, d))
+            {
                 continue;
             }
             match state {

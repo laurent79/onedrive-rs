@@ -6,6 +6,7 @@ pub mod decide;
 mod download;
 pub mod filter;
 pub mod local;
+pub mod moves;
 mod upload;
 
 use std::path::PathBuf;
@@ -103,6 +104,7 @@ pub struct Stats {
     pub uploaded_bytes: AtomicU64,
     pub folders_created_online: AtomicU64,
     pub deleted_online: AtomicU64,
+    pub moved_online: AtomicU64,
     /// Files changed both locally and online, kept as safeBackup.
     pub conflicts: AtomicU64,
 }

@@ -338,7 +338,7 @@ fn print_stats(s: &Stats, started: Instant, label: &str) {
     let g = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     tracing::info!(
         "{label}: {:.0?} elapsed, {} pages, {} items, {} downloaded ({:.1} MiB), {} unchanged, {} folders created, {} deleted, \
-         {} uploaded ({:.1} MiB), {} folders created online, {} deleted online, {} conflicts, {} skipped, {} errors",
+         {} uploaded ({:.1} MiB), {} folders created online, {} deleted online, {} moved online, {} conflicts, {} skipped, {} errors",
         started.elapsed(),
         g(&s.pages),
         g(&s.items),
@@ -351,6 +351,7 @@ fn print_stats(s: &Stats, started: Instant, label: &str) {
         g(&s.uploaded_bytes) as f64 / (1024.0 * 1024.0),
         g(&s.folders_created_online),
         g(&s.deleted_online),
+        g(&s.moved_online),
         g(&s.conflicts),
         g(&s.skipped),
         g(&s.errors),

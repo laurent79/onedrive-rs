@@ -129,3 +129,39 @@ async fn big_delete_is_refused() {
     assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
     std::fs::remove_dir_all(&tmp).unwrap();
 }
+
+#[tokio::test]
+async fn moves_are_detected() {
+    let tmp = std::env::temp_dir().join(format!("odrs-moves-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sync_dir = tmp.join("sync");
+    std::fs::create_dir_all(sync_dir.join("Docs")).unwrap();
+    let store = Store::open_in_memory().unwrap();
+    store.upsert(&item("R", "root", ItemType::Root, None)).unwrap();
+    store.upsert(&item("A", "Docs", ItemType::Dir, Some("R"))).unwrap();
+    tracked(&store, &sync_dir, "F1", "Docs/one.txt", "A", b"one");
+    tracked(&store, &sync_dir, "F2", "Docs/two.txt", "A", b"two");
+    tracked(&store, &sync_dir, "F3", "lonely.txt", "R", b"lonely content");
+
+    // Folder moved into a new folder and renamed; a file renamed in place.
+    std::fs::create_dir_all(sync_dir.join("Archive")).unwrap();
+    std::fs::rename(sync_dir.join("Docs"), sync_dir.join("Archive/Docs 2025")).unwrap();
+    std::fs::rename(sync_dir.join("lonely.txt"), sync_dir.join("renamed.txt")).unwrap();
+    // A genuinely new file with the same size and mtime but other content is not a move.
+    std::fs::write(sync_dir.join("decoy.txt"), b"other content!").unwrap();
+    filetime::set_file_mtime(sync_dir.join("decoy.txt"), filetime::FileTime::from_unix_time(T_UNIX, 0)).unwrap();
+
+    std::fs::write(tmp.join("refresh_token"), "fake").unwrap();
+    let graph = Arc::new(Graph::new(odrs_graph::http_client().unwrap(), AuthConfig::default(), TokenStore::new(tmp.join("refresh_token"))).unwrap());
+    let mut opts = SyncOptions::new(sync_dir.clone());
+    opts.dry_run = true;
+    let stats = Arc::new(Stats::default());
+    UploadSync::new(graph, &store, opts, stats.clone()).run("D").await.unwrap();
+
+    let g = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+    assert_eq!(g(&stats.moved_online), 2);
+    assert_eq!(g(&stats.deleted_online), 0);
+    assert_eq!(g(&stats.uploaded), 1, "only decoy.txt is uploaded");
+    assert_eq!(g(&stats.folders_created_online), 1, "Archive");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}

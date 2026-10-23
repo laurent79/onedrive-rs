@@ -256,6 +256,13 @@ impl Store {
         Ok(out)
     }
 
+    pub fn child_by_name(&self, drive_id: &str, parent_id: &str, name: &str) -> Result<Option<Item>> {
+        let mut stmt =
+            self.conn.prepare_cached(&format!("SELECT {COLUMNS} FROM item WHERE name = ?3 AND driveId = ?1 AND parentId = ?2"))?;
+        let mut rows = stmt.query(params![drive_id, parent_id, name])?;
+        rows.next()?.map(Item::from_row).transpose()
+    }
+
     /// Delete an item; its descendants go with it (`ON DELETE CASCADE`).
     pub fn delete(&self, drive_id: &str, id: &str) -> Result<()> {
         self.conn
