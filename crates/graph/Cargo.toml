@@ -17,3 +17,4 @@ time = { version = "0.3.55", features = ["serde", "parsing", "formatting", "macr
 tokio = { version = "1.54.1", features = ["rt", "net", "time", "io-util", "macros", "fs", "sync"] }
 tracing = "0.1.44"
 url = "2.5.8"
+odrs-quickxor = { version = "0.1.0", path = "../quickxor" }

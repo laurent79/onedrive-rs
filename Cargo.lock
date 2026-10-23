@@ -943,10 +943,10 @@ name = "odrs-engine"
 version = "0.1.0"
 dependencies = [
  "filetime",
- "futures-util",
  "odrs-graph",
  "odrs-quickxor",
  "odrs-store",
+ "serde_json",
  "thiserror",
  "time",
  "tokio",
@@ -960,6 +960,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "odrs-quickxor",
  "rand",
  "reqwest",
  "serde",
@@ -1008,6 +1009,7 @@ dependencies = [
  "dirs",
  "odrs-engine",
  "odrs-graph",
+ "odrs-quickxor",
  "odrs-store",
  "tokio",
  "tracing",
