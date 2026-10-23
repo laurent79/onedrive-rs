@@ -8,3 +8,4 @@ Exec=onedrive-rs gui
 Icon=io.github.onedrive_rs
 Categories=Network;FileTransfer;
 StartupNotify=false
+StartupWMClass=io.github.onedrive_rs

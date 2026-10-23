@@ -16,6 +16,8 @@ if [ "${1:-}" = "--autostart" ]; then
     install -Dm644 contrib/desktop/io.github.onedrive_rs-autostart.desktop "$HOME/.config/autostart/io.github.onedrive_rs.desktop"
 fi
 systemctl --user daemon-reload
+# KDE resolves Wayland window icons through its application cache.
+command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
 
 echo "Installed. Next: onedrive-rs login, then either"
 echo "  - a fresh sync:            systemctl --user enable --now onedrive-rs"
