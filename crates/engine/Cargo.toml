@@ -1,0 +1,15 @@
+[package]
+name = "odrs-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+filetime = "0.2.29"
+futures-util = "0.3.34"
+odrs-graph = { version = "0.1.0", path = "../graph" }
+odrs-quickxor = { version = "0.1.0", path = "../quickxor" }
+odrs-store = { version = "0.1.0", path = "../store" }
+thiserror = "2.0.21"
+time = "0.3.55"
+tokio = { version = "1.54.1", features = ["rt", "fs", "sync", "macros", "io-util"] }
+tracing = "0.1.44"
