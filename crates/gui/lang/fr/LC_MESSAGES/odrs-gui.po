@@ -49,6 +49,9 @@ msgstr "{} fichiers ({} Gio)"
 msgid "Unchanged"
 msgstr "Inchangés"
 
+msgid "Uploaded"
+msgstr "Envoyés"
+
 msgid "Skipped"
 msgstr "Ignorés"
 

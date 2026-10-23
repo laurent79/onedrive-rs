@@ -4,7 +4,9 @@
 pub mod convert;
 pub mod decide;
 mod download;
+pub mod filter;
 pub mod local;
+mod upload;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use odrs_graph::Graph;
 use odrs_store::Store;
 
 pub use download::DownloadSync;
+pub use upload::UploadSync;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,6 +54,31 @@ pub struct SyncOptions {
     pub max_transfers: usize,
     /// Used in safeBackup file names.
     pub device_name: String,
+    /// Local names never uploaded (D: `skip_file`).
+    pub skip_file: filter::SkipList,
+    /// Refuse online deletions of more items than this in one pass (D: `classify_as_big_delete`).
+    pub big_delete_threshold: u64,
+    /// Report what would be done without changing anything (online or local).
+    pub dry_run: bool,
+}
+
+impl SyncOptions {
+    pub fn new(sync_dir: PathBuf) -> Self {
+        Self {
+            sync_dir,
+            max_transfers: 8,
+            device_name: local::device_name(),
+            skip_file: filter::SkipList::default(),
+            big_delete_threshold: 1000,
+            dry_run: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    DownloadOnly,
+    Bidirectional,
 }
 
 /// Live counters, readable from another task for progress reporting.
@@ -65,9 +93,31 @@ pub struct Stats {
     pub deleted: AtomicU64,
     pub skipped: AtomicU64,
     pub errors: AtomicU64,
+    pub uploaded: AtomicU64,
+    pub uploaded_bytes: AtomicU64,
+    pub folders_created_online: AtomicU64,
+    pub deleted_online: AtomicU64,
+    /// Files changed both locally and online, kept as safeBackup.
+    pub conflicts: AtomicU64,
 }
 
-/// Run one download-only pass: fetch all pending `/delta` changes and apply them locally.
-pub async fn sync_download_only(graph: Arc<Graph>, store: &Store, opts: SyncOptions, stats: Arc<Stats>) -> Result<(), Error> {
-    DownloadSync::new(graph, store, opts, stats).run().await
+/// Run one pass: apply pending online changes (`/delta`) locally, then, in
+/// bidirectional mode, push local changes online (D's default remote-first order).
+///
+/// In dry-run mode the online changes are not fetched at all; only the local
+/// side is compared with the database and reported.
+pub async fn sync(graph: Arc<Graph>, store: &Store, opts: SyncOptions, stats: Arc<Stats>, mode: SyncMode) -> Result<(), Error> {
+    let drive_id = if opts.dry_run {
+        let drive = graph.me_drive().await?;
+        match store.root(&drive.id)? {
+            Some(root) => root.drive_id,
+            None => drive.id,
+        }
+    } else {
+        DownloadSync::new(graph.clone(), store, opts.clone(), stats.clone()).run().await?
+    };
+    if mode == SyncMode::Bidirectional {
+        UploadSync::new(graph, store, opts, stats).run(&drive_id).await?;
+    }
+    Ok(())
 }

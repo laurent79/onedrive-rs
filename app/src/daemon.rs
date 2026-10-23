@@ -1,12 +1,11 @@
 //! `onedrive-rs daemon`: periodic sync passes, controlled over D-Bus.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use odrs_engine::{Stats, SyncOptions};
+use odrs_engine::{Stats, SyncMode, SyncOptions};
 use odrs_graph::{AuthConfig, Graph};
 use odrs_ipc::{Command, Info, Progress, Server, State};
 use odrs_store::Store;
@@ -17,11 +16,11 @@ use crate::Paths;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-pub async fn run(paths: &Paths, auth: AuthConfig, sync_dir: PathBuf, transfers: usize, interval: Duration) -> Result<()> {
+pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncMode, interval: Duration) -> Result<()> {
     let _lock = crate::lock(paths)?;
     let graph = Arc::new(Graph::new(odrs_graph::http_client()?, auth, paths.token_store())?);
     let store = Store::open(&paths.db())?;
-    let opts = SyncOptions { sync_dir: sync_dir.clone(), max_transfers: transfers, device_name: odrs_engine::local::device_name() };
+    let sync_dir = opts.sync_dir.clone();
 
     let account = match graph.me_drive().await {
         Ok(d) => d.owner.and_then(|o| o.user).and_then(|u| u.email.or(u.display_name)).unwrap_or_default(),
@@ -33,7 +32,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, sync_dir: PathBuf, transfers: 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let info = Info { account, sync_dir: sync_dir.display().to_string() };
     let server = Server::start(info, tx).await.context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
-    tracing::info!(interval = ?interval, sync_dir = %sync_dir.display(), "daemon started");
+    tracing::info!(interval = ?interval, ?mode, sync_dir = %sync_dir.display(), "daemon started");
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut paused = false;
@@ -78,7 +77,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, sync_dir: PathBuf, transfers: 
         });
         let started = Instant::now();
         let outcome = tokio::select! {
-            r = odrs_engine::sync_download_only(graph.clone(), &store, opts.clone(), stats.clone()) => Some(r),
+            r = odrs_engine::sync(graph.clone(), &store, opts.clone(), stats.clone(), mode) => Some(r),
             () = until_pause(&mut rx) => None,
             _ = tokio::signal::ctrl_c() => { ticker.abort(); break }
             _ = sigterm.recv() => { ticker.abort(); break }
@@ -134,6 +133,8 @@ fn progress(s: &Stats) -> Progress {
         unchanged: g(&s.unchanged),
         deleted: g(&s.deleted),
         skipped: g(&s.skipped),
+        uploaded: g(&s.uploaded),
+        deleted_online: g(&s.deleted_online),
         errors: g(&s.errors),
     }
 }

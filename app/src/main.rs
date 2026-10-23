@@ -40,9 +40,15 @@ enum Command {
     },
     /// Run one synchronisation pass.
     Sync {
-        /// Only apply online changes locally (the only mode implemented so far).
-        #[arg(long)]
+        #[arg(long, value_enum, default_value_t = Mode::DownloadOnly)]
+        mode: Mode,
+        /// Kept for compatibility: same as `--mode download-only`.
+        #[arg(long, hide = true)]
         download_only: bool,
+        /// Report what would be uploaded/deleted online without changing anything
+        /// (online changes are not fetched).
+        #[arg(long)]
+        dry_run: bool,
         /// Local folder to synchronise.
         #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
         sync_dir: Option<PathBuf>,
@@ -67,6 +73,8 @@ enum Command {
     },
     /// Run as a background service: periodic sync passes, controlled over D-Bus.
     Daemon {
+        #[arg(long, value_enum, default_value_t = Mode::DownloadOnly)]
+        mode: Mode,
         /// Local folder to synchronise.
         #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
         sync_dir: Option<PathBuf>,
@@ -89,6 +97,24 @@ enum Command {
         #[arg(long)]
         hidden: bool,
     },
+}
+
+/// Sync direction. Download-only stays the default until uploads are validated on a real account.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Mode {
+    /// Only apply online changes locally.
+    DownloadOnly,
+    /// Also upload local changes (new, modified, deleted files and folders).
+    Bidirectional,
+}
+
+impl From<Mode> for odrs_engine::SyncMode {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::DownloadOnly => odrs_engine::SyncMode::DownloadOnly,
+            Mode::Bidirectional => odrs_engine::SyncMode::Bidirectional,
+        }
+    }
 }
 
 struct Paths {
@@ -164,15 +190,15 @@ fn spawn_daemon() -> std::io::Result<()> {
 async fn run(command: Command, paths: Paths, auth: AuthConfig) -> Result<()> {
     match command {
         Command::Login { manual, read_only } => login(&paths, AuthConfig { read_only, ..auth }, manual).await,
-        Command::Sync { download_only, sync_dir, transfers } => {
-            if !download_only {
-                bail!("only --download-only is implemented for now");
-            }
-            let sync_dir = match sync_dir {
+        Command::Sync { mode, download_only, dry_run, sync_dir, transfers } => {
+            let mode = if download_only { Mode::DownloadOnly } else { mode };
+            let mut opts = SyncOptions::new(match sync_dir {
                 Some(d) => d,
                 None => default_sync_dir()?,
-            };
-            sync(&paths, auth, sync_dir, transfers).await
+            });
+            opts.max_transfers = transfers;
+            opts.dry_run = dry_run;
+            sync(&paths, auth, opts, mode.into()).await
         }
         Command::Status => status(&paths, auth).await,
         Command::Verify { db, dir, limit } => {
@@ -182,12 +208,13 @@ async fn run(command: Command, paths: Paths, auth: AuthConfig) -> Result<()> {
             };
             verify(&db.unwrap_or_else(|| paths.db()), &dir, limit)
         }
-        Command::Daemon { sync_dir, transfers, interval } => {
-            let sync_dir = match sync_dir {
+        Command::Daemon { mode, sync_dir, transfers, interval } => {
+            let mut opts = SyncOptions::new(match sync_dir {
                 Some(d) => d,
                 None => default_sync_dir()?,
-            };
-            daemon::run(&paths, auth, sync_dir, transfers, Duration::from_secs(interval)).await
+            });
+            opts.max_transfers = transfers;
+            daemon::run(&paths, auth, opts, mode.into(), Duration::from_secs(interval)).await
         }
         Command::SyncNow | Command::Pause | Command::Resume => {
             let client = odrs_ipc::Client::new().await?;
@@ -247,13 +274,11 @@ fn lock(paths: &Paths) -> Result<std::fs::File> {
     }
 }
 
-async fn sync(paths: &Paths, auth: AuthConfig, sync_dir: PathBuf, transfers: usize) -> Result<()> {
+async fn sync(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: odrs_engine::SyncMode) -> Result<()> {
     let _lock = lock(paths)?;
     let graph = Arc::new(Graph::new(odrs_graph::http_client()?, auth, paths.token_store())?);
     let store = Store::open(&paths.db())?;
     let stats = Arc::new(Stats::default());
-    let opts = SyncOptions { sync_dir, max_transfers: transfers, device_name: odrs_engine::local::device_name() };
-
     let started = Instant::now();
     let progress = tokio::spawn({
         let stats = stats.clone();
@@ -267,7 +292,7 @@ async fn sync(paths: &Paths, auth: AuthConfig, sync_dir: PathBuf, transfers: usi
         }
     });
     let result = tokio::select! {
-        r = odrs_engine::sync_download_only(graph, &store, opts, stats.clone()) => r.map_err(anyhow::Error::from),
+        r = odrs_engine::sync(graph, &store, opts, stats.clone(), mode) => r.map_err(anyhow::Error::from),
         _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!("interrupted")),
     };
     progress.abort();
@@ -278,7 +303,8 @@ async fn sync(paths: &Paths, auth: AuthConfig, sync_dir: PathBuf, transfers: usi
 fn print_stats(s: &Stats, started: Instant, label: &str) {
     let g = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     tracing::info!(
-        "{label}: {:.0?} elapsed, {} pages, {} items, {} downloaded ({:.1} MiB), {} unchanged, {} folders created, {} deleted, {} skipped, {} errors",
+        "{label}: {:.0?} elapsed, {} pages, {} items, {} downloaded ({:.1} MiB), {} unchanged, {} folders created, {} deleted, \
+         {} uploaded ({:.1} MiB), {} folders created online, {} deleted online, {} conflicts, {} skipped, {} errors",
         started.elapsed(),
         g(&s.pages),
         g(&s.items),
@@ -287,6 +313,11 @@ fn print_stats(s: &Stats, started: Instant, label: &str) {
         g(&s.unchanged),
         g(&s.dirs_created),
         g(&s.deleted),
+        g(&s.uploaded),
+        g(&s.uploaded_bytes) as f64 / (1024.0 * 1024.0),
+        g(&s.folders_created_online),
+        g(&s.deleted_online),
+        g(&s.conflicts),
         g(&s.skipped),
         g(&s.errors),
     );

@@ -16,7 +16,7 @@ use crate::types::{DELTA_SELECT, DeltaPage, Drive, DriveItem};
 
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const USER_AGENT: &str = concat!("ISV|onedrive-rs|onedrive-rs/", env!("CARGO_PKG_VERSION"));
-const MAX_ATTEMPTS: u32 = 8;
+pub(crate) const MAX_ATTEMPTS: u32 = 8;
 /// Throttling (429/503) is retried for this long before giving up.
 const MAX_THROTTLED: Duration = Duration::from_secs(3600);
 /// Refresh the access token when it expires within this margin.
@@ -31,7 +31,7 @@ pub fn http_client() -> Result<reqwest::Client> {
 }
 
 pub struct Graph {
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     cfg: AuthConfig,
     store: TokenStore,
     tokens: Mutex<Option<Tokens>>,
@@ -85,7 +85,7 @@ impl Graph {
     }
 
     /// Sleep while a throttling window announced by Graph is in effect.
-    async fn wait_throttle(&self) {
+    pub(crate) async fn wait_throttle(&self) {
         loop {
             let until = *self.throttled_until.lock().unwrap();
             match until {
@@ -95,7 +95,7 @@ impl Graph {
         }
     }
 
-    fn throttle(&self, delay: Duration) {
+    pub(crate) fn throttle(&self, delay: Duration) {
         let until = Instant::now() + delay;
         let mut guard = self.throttled_until.lock().unwrap();
         if guard.is_none_or(|t| t < until) {
@@ -108,7 +108,7 @@ impl Graph {
     ///
     /// 429/503 pause *all* requests of this client for `Retry-After` and are
     /// retried for up to [`MAX_THROTTLED`]; other failures up to [`MAX_ATTEMPTS`] times.
-    async fn send(&self, method: Method, url: &str, build: impl Fn(RequestBuilder) -> RequestBuilder) -> Result<Response> {
+    pub(crate) async fn send(&self, method: Method, url: &str, build: impl Fn(RequestBuilder) -> Result<RequestBuilder>) -> Result<Response> {
         let mut attempt = 0;
         let mut force_refresh = false;
         let started = Instant::now();
@@ -121,7 +121,7 @@ impl Graph {
             if self.prefer_add_to_onedrive.load(Ordering::Relaxed) {
                 req = req.header("Prefer", "Include-Feature=AddToOneDrive");
             }
-            let delay = match build(req).send().await {
+            let delay = match build(req)?.send().await {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) => {
                     let status = resp.status();
@@ -162,7 +162,7 @@ impl Graph {
     }
 
     pub async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let resp = self.send(Method::GET, url, |r| r).await?;
+        let resp = self.send(Method::GET, url, Ok).await?;
         let bytes = resp.bytes().await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
@@ -204,7 +204,7 @@ impl Graph {
     }
 
     async fn download_once(&self, url: &str, dest: &Path) -> Result<(String, u64)> {
-        let resp = self.send(Method::GET, url, |r| r).await?;
+        let resp = self.send(Method::GET, url, Ok).await?;
         let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, tokio::fs::File::create(dest).await?);
         let mut hasher = odrs_quickxor::QuickXor::new();
         let mut size = 0u64;
@@ -221,6 +221,6 @@ impl Graph {
     }
 }
 
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     Duration::from_secs((1u64 << attempt.min(6)).min(60))
 }

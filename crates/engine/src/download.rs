@@ -43,7 +43,8 @@ impl<'a> DownloadSync<'a> {
         Self { graph, store, opts, stats, drive_id: String::new(), tasks: JoinSet::new(), in_flight: HashSet::new() }
     }
 
-    pub async fn run(mut self) -> Result<(), Error> {
+    /// Returns the drive id of the synchronised root.
+    pub async fn run(mut self) -> Result<String, Error> {
         self.store.abort_open_transaction()?;
         std::fs::create_dir_all(&self.opts.sync_dir)?;
         let drive = self.graph.me_drive().await?;
@@ -101,7 +102,7 @@ impl<'a> DownloadSync<'a> {
             (n, _) => tracing::warn!(errors = n, "sync finished with errors; deltaLink not saved, the next run will retry"),
         }
         self.store.commit()?;
-        Ok(())
+        Ok(root_drive)
     }
 
     fn local_path(&self, rel: &str) -> PathBuf {
@@ -329,7 +330,7 @@ impl<'a> DownloadSync<'a> {
     }
 }
 
-async fn hash_file(path: PathBuf) -> Result<String, Error> {
+pub(crate) async fn hash_file(path: PathBuf) -> Result<String, Error> {
     tokio::task::spawn_blocking(move || odrs_quickxor::hash_file(&path))
         .await
         .map_err(|e| Error::Task(e.to_string()))?

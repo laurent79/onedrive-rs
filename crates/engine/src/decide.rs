@@ -60,6 +60,33 @@ pub fn may_delete_local(prev: &Item, local: LocalState, prev_mtime: i64, local_h
     }
 }
 
+/// State of a tracked file found locally during the upload-side walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalChange {
+    Unchanged,
+    /// Same content, only the local mtime differs: put the recorded mtime back.
+    MtimeOnly,
+    /// Content differs from what was last synced: upload it.
+    Modified,
+}
+
+/// Cheap check (D's `isItemSynced`: whole-second mtime first). `None` means
+/// the local file must be hashed.
+pub fn local_change_without_hash(db: &Item, size: u64, mtime: i64, db_mtime: i64) -> Option<LocalChange> {
+    if mtime == db_mtime && Some(size as i64) == db.size {
+        return Some(LocalChange::Unchanged);
+    }
+    if db.quick_xor_hash.is_none() || Some(size as i64) != db.size {
+        // Without a comparable hash, or with another size, the content did change.
+        return Some(LocalChange::Modified);
+    }
+    None
+}
+
+pub fn local_change_with_hash(db: &Item, local_hash: &str) -> LocalChange {
+    if db.quick_xor_hash.as_deref() == Some(local_hash) { LocalChange::MtimeOnly } else { LocalChange::Modified }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +146,17 @@ mod tests {
         assert_eq!(decide_with_hash(Some(&prev), &new, local, T, "old"), FileAction::Download { backup: false });
         assert_eq!(decide_with_hash(Some(&prev), &new, local, T, "edited"), FileAction::Download { backup: true });
         assert_eq!(decide_with_hash(None, &new, local, T, "other"), FileAction::Download { backup: true });
+    }
+
+    #[test]
+    fn local_changes() {
+        let db = file(Some("h"), 3);
+        assert_eq!(local_change_without_hash(&db, 3, T, T), Some(LocalChange::Unchanged));
+        assert_eq!(local_change_without_hash(&db, 4, T + 1, T), Some(LocalChange::Modified));
+        assert_eq!(local_change_without_hash(&db, 3, T + 1, T), None);
+        assert_eq!(local_change_with_hash(&db, "h"), LocalChange::MtimeOnly);
+        assert_eq!(local_change_with_hash(&db, "x"), LocalChange::Modified);
+        assert_eq!(local_change_without_hash(&file(None, 3), 3, T + 1, T), Some(LocalChange::Modified));
     }
 
     #[test]

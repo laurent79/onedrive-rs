@@ -249,6 +249,16 @@ impl Store {
         Ok(())
     }
 
+    /// Number of items below `id` (not counting `id` itself).
+    pub fn count_descendants(&self, drive_id: &str, id: &str) -> Result<u64> {
+        let mut stmt = self.conn.prepare_cached(
+            "WITH RECURSIVE sub(id) AS (SELECT id FROM item WHERE driveId = ?1 AND parentId = ?2
+               UNION ALL SELECT item.id FROM item JOIN sub ON item.driveId = ?1 AND item.parentId = sub.id)
+             SELECT count(*) FROM sub",
+        )?;
+        Ok(stmt.query_row(params![drive_id, id], |r| r.get::<_, i64>(0))? as u64)
+    }
+
     /// Path relative to the sync root (`""` for the root itself), built by
     /// walking up `parentId`. `None` if the item or one of its ancestors is unknown.
     pub fn path_of(&self, drive_id: &str, id: &str) -> Result<Option<String>> {
@@ -356,6 +366,8 @@ mod tests {
         s.set_delta_link("D", "R", Some("link")).unwrap();
         assert_eq!(s.delta_link("D", "R").unwrap().as_deref(), Some("link"));
 
+        assert_eq!(s.count_descendants("D", "R").unwrap(), 2);
+        assert_eq!(s.count_descendants("D", "F").unwrap(), 0);
         s.delete("D", "A").unwrap();
         assert!(s.get("D", "F").unwrap().is_none());
         assert_eq!(s.children("D", "R").unwrap().len(), 0);

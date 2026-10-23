@@ -164,6 +164,7 @@ fn to_status(s: Option<&Snapshot>) -> Status {
         downloaded: int(p.downloaded),
         gib: p.bytes as f32 / (1u64 << 30) as f32,
         unchanged: int(p.unchanged),
+        uploaded: int(p.uploaded),
         skipped: int(p.skipped),
         errors: int(p.errors),
     }

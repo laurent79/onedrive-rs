@@ -44,6 +44,8 @@ pub struct Progress {
     pub deleted: u64,
     pub skipped: u64,
     pub errors: u64,
+    pub uploaded: u64,
+    pub deleted_online: u64,
 }
 
 /// Commands sent by clients to the daemon loop.
