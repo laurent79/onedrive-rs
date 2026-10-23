@@ -60,6 +60,10 @@ pub struct SyncOptions {
     pub big_delete_threshold: u64,
     /// Report what would be done without changing anything (online or local).
     pub dry_run: bool,
+    /// Mode of directories created locally (D: `sync_dir_permissions`, default 700).
+    pub dir_mode: u32,
+    /// Mode of files downloaded (D: `sync_file_permissions`, default 600).
+    pub file_mode: u32,
 }
 
 impl SyncOptions {
@@ -71,6 +75,8 @@ impl SyncOptions {
             skip_file: filter::SkipList::default(),
             big_delete_threshold: 1000,
             dry_run: false,
+            dir_mode: 0o700,
+            file_mode: 0o600,
         }
     }
 }

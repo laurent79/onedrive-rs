@@ -63,7 +63,7 @@ impl<'a> DownloadSync<'a> {
     /// Returns the drive id of the synchronised root.
     pub async fn run(mut self) -> Result<String, Error> {
         self.store.abort_open_transaction()?;
-        std::fs::create_dir_all(&self.opts.sync_dir)?;
+        local::create_dir_all(&self.opts.sync_dir, self.opts.dir_mode)?;
         let drive = self.graph.me_drive().await?;
         self.graph.set_prefer_add_to_onedrive(drive.is_personal());
         self.drive_id = drive.id.clone();
@@ -197,7 +197,7 @@ impl<'a> DownloadSync<'a> {
         let (old, new) = (self.local_path(&old_rel), self.local_path(new_rel));
         if local::stat(&old)? != LocalState::Absent && local::stat(&new)? == LocalState::Absent {
             if let Some(parent) = new.parent() {
-                std::fs::create_dir_all(parent)?;
+                local::create_dir_all(parent, self.opts.dir_mode)?;
             }
             std::fs::rename(&old, &new)?;
             tracing::info!(from = %old_rel, to = %new_rel, "moved");
@@ -210,7 +210,7 @@ impl<'a> DownloadSync<'a> {
         match local::stat(&path)? {
             LocalState::Dir => {}
             LocalState::Absent => {
-                std::fs::create_dir_all(&path)?;
+                local::create_dir_all(&path, self.opts.dir_mode)?;
                 self.stats.dirs_created.fetch_add(1, Ordering::Relaxed);
             }
             _ => return Err(Error::Blocked(path)),
@@ -243,11 +243,12 @@ impl<'a> DownloadSync<'a> {
                     self.join_one().await?;
                 }
                 let device = backup.then(|| self.opts.device_name.clone());
+                let file_mode = self.opts.file_mode;
                 let graph = self.graph.clone();
                 let stats = self.stats.clone();
                 self.in_flight.insert(db.id.clone());
                 self.tasks.spawn(async move {
-                    let result = download(&graph, &db, &path, mtime, device.as_deref()).await;
+                    let result = download(&graph, &db, &path, mtime, device.as_deref(), file_mode).await;
                     if let Ok(bytes) = result {
                         stats.downloaded.fetch_add(1, Ordering::Relaxed);
                         stats.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -365,7 +366,14 @@ pub(crate) async fn hash_file(path: PathBuf) -> Result<String, Error> {
 }
 
 /// Download into `<path>.partial`, verify, set mtime, then atomically replace `path`.
-pub(crate) async fn download(graph: &Graph, item: &Item, path: &Path, mtime: OffsetDateTime, backup_device: Option<&str>) -> Result<u64, Error> {
+pub(crate) async fn download(
+    graph: &Graph,
+    item: &Item,
+    path: &Path,
+    mtime: OffsetDateTime,
+    backup_device: Option<&str>,
+    file_mode: u32,
+) -> Result<u64, Error> {
     let partial = local::partial_path(path);
     let result = async {
         let (hash, size) = graph.download_to(&item.drive_id, &item.id, &partial).await?;
@@ -377,6 +385,7 @@ pub(crate) async fn download(graph: &Graph, item: &Item, path: &Path, mtime: Off
         if item.size.is_some_and(|s| s != size as i64) {
             return Err(Error::Integrity(format!("size {size} != expected {:?}", item.size)));
         }
+        local::set_permissions(&partial, file_mode)?;
         local::set_mtime(&partial, mtime)?;
         if let Some(device) = backup_device
             && matches!(local::stat(path)?, LocalState::File { .. })

@@ -40,7 +40,7 @@ enum Command {
     },
     /// Run one synchronisation pass.
     Sync {
-        #[arg(long, value_enum, default_value_t = Mode::DownloadOnly)]
+        #[arg(long, value_enum, default_value_t = Mode::Bidirectional)]
         mode: Mode,
         /// Kept for compatibility: same as `--mode download-only`.
         #[arg(long, hide = true)]
@@ -73,7 +73,7 @@ enum Command {
     },
     /// Run as a background service: periodic sync passes, controlled over D-Bus.
     Daemon {
-        #[arg(long, value_enum, default_value_t = Mode::DownloadOnly)]
+        #[arg(long, value_enum, default_value_t = Mode::Bidirectional)]
         mode: Mode,
         /// Local folder to synchronise.
         #[arg(long, env = "ONEDRIVE_RS_SYNC_DIR")]
@@ -99,7 +99,7 @@ enum Command {
     },
 }
 
-/// Sync direction. Download-only stays the default until uploads are validated on a real account.
+/// Sync direction.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Mode {
     /// Only apply online changes locally.

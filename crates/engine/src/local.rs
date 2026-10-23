@@ -30,6 +30,17 @@ pub fn stat(path: &Path) -> io::Result<LocalState> {
     }
 }
 
+/// `mkdir -p` with `mode` for the directories created (D: `sync_dir_permissions`).
+pub fn create_dir_all(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new().recursive(true).mode(mode).create(path)
+}
+
+pub fn set_permissions(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
 pub fn set_mtime(path: &Path, t: OffsetDateTime) -> io::Result<()> {
     filetime::set_file_mtime(path, FileTime::from_unix_time(t.unix_timestamp(), 0))
 }

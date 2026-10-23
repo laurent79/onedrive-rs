@@ -219,8 +219,9 @@ impl<'a> UploadSync<'a> {
         let graph = self.graph.clone();
         let path = self.local_path(&rel);
         let device = self.opts.device_name.clone();
+        let file_mode = self.opts.file_mode;
         self.tasks.spawn(async move {
-            let result = upload(&graph, &target, &path, size, mtime, &device).await;
+            let result = upload(&graph, &target, &path, size, mtime, &device, file_mode).await;
             Uploaded { rel, result }
         });
         Ok(())
@@ -312,7 +313,15 @@ impl<'a> UploadSync<'a> {
 /// local version is kept aside as a safeBackup (uploaded as a new file on the
 /// next pass) and the current online version is downloaded in its place, as
 /// the D client does; nothing relies on `/delta` re-delivering that item.
-async fn upload(graph: &Graph, target: &UploadTarget, path: &std::path::Path, size: u64, mtime: i64, device: &str) -> Result<Outcome, Error> {
+async fn upload(
+    graph: &Graph,
+    target: &UploadTarget,
+    path: &std::path::Path,
+    size: u64,
+    mtime: i64,
+    device: &str,
+    file_mode: u32,
+) -> Result<Outcome, Error> {
     let local_hash = crate::download::hash_file(path.to_owned()).await?;
     let mtime_str = OffsetDateTime::from_unix_timestamp(mtime).map(format_db_time).unwrap_or_default();
     let drive_id = match target {
@@ -326,7 +335,7 @@ async fn upload(graph: &Graph, target: &UploadTarget, path: &std::path::Path, si
             tracing::warn!(path = %path.display(), backup = %backup.display(), "changed both locally and online; local version kept as safeBackup");
             let online = to_db_item(&graph.get_item(&drive_id, item_id).await?, &drive_id)?;
             let online_mtime = parse_graph_time(&online.mtime).ok_or(Error::InvalidItem(online.id.clone(), "bad mtime"))?;
-            crate::download::download(graph, &online, path, online_mtime, None).await?;
+            crate::download::download(graph, &online, path, online_mtime, None, file_mode).await?;
             return Ok(Outcome::Conflict(online));
         }
         Err(e) => return Err(e.into()),
