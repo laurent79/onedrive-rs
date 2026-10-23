@@ -46,6 +46,10 @@ fn child_url(drive_id: &str, parent_id: &str, name: &str) -> String {
 }
 
 impl Graph {
+    pub async fn get_item(&self, drive_id: &str, item_id: &str) -> Result<DriveItem> {
+        self.get_json(&format!("{GRAPH_BASE}/drives/{drive_id}/items/{item_id}")).await
+    }
+
     /// Child `name` of folder `parent_id`, or `None` if it does not exist.
     pub async fn get_child(&self, drive_id: &str, parent_id: &str, name: &str) -> Result<Option<DriveItem>> {
         match self.get_json(&child_url(drive_id, parent_id, name)).await {

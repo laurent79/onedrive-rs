@@ -25,9 +25,16 @@ use crate::filter::is_valid_onedrive_name;
 use crate::local::{self, LocalState};
 use crate::{Error, Stats, SyncOptions};
 
+enum Outcome {
+    Uploaded(Item, u64),
+    /// Changed both locally and online: the local version was kept as a
+    /// safeBackup and the online version downloaded in its place.
+    Conflict(Item),
+}
+
 struct Uploaded {
     rel: String,
-    result: Result<Option<(Item, u64)>, Error>,
+    result: Result<Outcome, Error>,
 }
 
 pub struct UploadSync<'a> {
@@ -261,14 +268,14 @@ impl<'a> UploadSync<'a> {
 
     fn record(&mut self, done: Uploaded) -> Result<(), Error> {
         match done.result {
-            Ok(Some((item, size))) => {
+            Ok(Outcome::Uploaded(item, size)) => {
                 self.stats.uploaded.fetch_add(1, Ordering::Relaxed);
                 self.stats.uploaded_bytes.fetch_add(size, Ordering::Relaxed);
                 Ok(self.store.upsert(&item)?)
             }
-            Ok(None) => {
+            Ok(Outcome::Conflict(item)) => {
                 self.stats.conflicts.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(self.store.upsert(&item)?)
             }
             Err(e) if e.is_fatal() => Err(e),
             Err(e) => {
@@ -301,10 +308,11 @@ impl<'a> UploadSync<'a> {
     }
 }
 
-/// Upload one file. `Ok(None)` means a conflict: the file changed online since
-/// the last sync, so the local version was kept aside as a safeBackup (it will
-/// be uploaded as a new file and the online version downloaded on the next pass).
-async fn upload(graph: &Graph, target: &UploadTarget, path: &std::path::Path, size: u64, mtime: i64, device: &str) -> Result<Option<(Item, u64)>, Error> {
+/// Upload one file. If it changed online since the last sync (HTTP 412), the
+/// local version is kept aside as a safeBackup (uploaded as a new file on the
+/// next pass) and the current online version is downloaded in its place, as
+/// the D client does; nothing relies on `/delta` re-delivering that item.
+async fn upload(graph: &Graph, target: &UploadTarget, path: &std::path::Path, size: u64, mtime: i64, device: &str) -> Result<Outcome, Error> {
     let local_hash = crate::download::hash_file(path.to_owned()).await?;
     let mtime_str = OffsetDateTime::from_unix_timestamp(mtime).map(format_db_time).unwrap_or_default();
     let drive_id = match target {
@@ -313,9 +321,13 @@ async fn upload(graph: &Graph, target: &UploadTarget, path: &std::path::Path, si
     let uploaded = match graph.upload_file(target, path, size, &mtime_str).await {
         Ok(item) => item,
         Err(e) if e.status() == Some(412) => {
+            let UploadTarget::Replace { item_id, .. } = target else { return Err(e.into()) };
             let backup = local::safe_backup(path, device)?;
             tracing::warn!(path = %path.display(), backup = %backup.display(), "changed both locally and online; local version kept as safeBackup");
-            return Ok(None);
+            let online = to_db_item(&graph.get_item(&drive_id, item_id).await?, &drive_id)?;
+            let online_mtime = parse_graph_time(&online.mtime).ok_or(Error::InvalidItem(online.id.clone(), "bad mtime"))?;
+            crate::download::download(graph, &online, path, online_mtime, None).await?;
+            return Ok(Outcome::Conflict(online));
         }
         Err(e) => return Err(e.into()),
     };
@@ -335,5 +347,5 @@ async fn upload(graph: &Graph, target: &UploadTarget, path: &std::path::Path, si
         item.size = Some(size as i64);
         item.mtime = mtime_str;
     }
-    Ok(Some((item, size)))
+    Ok(Outcome::Uploaded(item, size))
 }

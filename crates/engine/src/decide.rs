@@ -1,6 +1,6 @@
 //! Pure decisions for download-only reconciliation of a single file.
 
-use odrs_store::Item;
+use odrs_store::{Item, ItemType};
 
 use crate::local::LocalState;
 
@@ -50,6 +50,22 @@ pub fn decide_with_hash(prev: Option<&Item>, new: &Item, local: LocalState, new_
     FileAction::Download { backup: true }
 }
 
+/// In bidirectional mode, an item already synced whose online content did not
+/// change but which is missing locally was deleted by the user: the download
+/// pass must not restore it (the upload walk deletes it online). Folder eTags
+/// change with their children, so a known folder counts as unchanged.
+pub fn is_local_deletion(prev: Option<&Item>, new: &Item, local: LocalState) -> bool {
+    if local != LocalState::Absent {
+        return false;
+    }
+    let Some(p) = prev else { return false };
+    match (p.item_type, new.item_type) {
+        (ItemType::Dir, ItemType::Dir) => true,
+        (ItemType::File, ItemType::File) => p.quick_xor_hash.is_some() && p.quick_xor_hash == new.quick_xor_hash && p.size == new.size,
+        _ => false,
+    }
+}
+
 /// An online deletion may remove the local file only if it is still the synced version.
 pub fn may_delete_local(prev: &Item, local: LocalState, prev_mtime: i64, local_hash: Option<&str>) -> bool {
     let LocalState::File { size, mtime } = local else { return false };
@@ -90,7 +106,6 @@ pub fn local_change_with_hash(db: &Item, local_hash: &str) -> LocalChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use odrs_store::ItemType;
 
     fn file(hash: Option<&str>, size: i64) -> Item {
         Item {
@@ -157,6 +172,16 @@ mod tests {
         assert_eq!(local_change_with_hash(&db, "h"), LocalChange::MtimeOnly);
         assert_eq!(local_change_with_hash(&db, "x"), LocalChange::Modified);
         assert_eq!(local_change_without_hash(&file(None, 3), 3, T + 1, T), Some(LocalChange::Modified));
+    }
+
+    #[test]
+    fn local_deletions_are_not_restored() {
+        let prev = file(Some("h"), 3);
+        assert!(is_local_deletion(Some(&prev), &file(Some("h"), 3), LocalState::Absent));
+        // Changed online: the online version wins over the local deletion.
+        assert!(!is_local_deletion(Some(&prev), &file(Some("new"), 3), LocalState::Absent));
+        assert!(!is_local_deletion(None, &file(Some("h"), 3), LocalState::Absent));
+        assert!(!is_local_deletion(Some(&prev), &file(Some("h"), 3), LocalState::File { size: 3, mtime: T }));
     }
 
     #[test]

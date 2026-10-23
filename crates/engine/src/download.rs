@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use tokio::task::JoinSet;
 
 use crate::convert::{is_safe_name, parse_graph_time, to_db_item};
-use crate::decide::{FileAction, decide_with_hash, decide_without_hash, may_delete_local};
+use crate::decide::{FileAction, decide_with_hash, decide_without_hash, is_local_deletion, may_delete_local};
 use crate::local::{self, LocalState};
 use crate::{Error, Stats, SyncOptions};
 
@@ -36,11 +36,28 @@ pub struct DownloadSync<'a> {
     drive_id: String,
     tasks: JoinSet<Outcome>,
     in_flight: HashSet<String>,
+    keep_local_deletions: bool,
 }
 
 impl<'a> DownloadSync<'a> {
     pub fn new(graph: Arc<Graph>, store: &'a Store, opts: SyncOptions, stats: Arc<Stats>) -> Self {
-        Self { graph, store, opts, stats, drive_id: String::new(), tasks: JoinSet::new(), in_flight: HashSet::new() }
+        Self {
+            graph,
+            store,
+            opts,
+            stats,
+            drive_id: String::new(),
+            tasks: JoinSet::new(),
+            in_flight: HashSet::new(),
+            keep_local_deletions: false,
+        }
+    }
+
+    /// Bidirectional mode: do not restore synced items the user deleted locally
+    /// (see [`is_local_deletion`]); download-only mode restores them.
+    pub fn keep_local_deletions(mut self, on: bool) -> Self {
+        self.keep_local_deletions = on;
+        self
     }
 
     /// Returns the drive id of the synchronised root.
@@ -56,7 +73,7 @@ impl<'a> DownloadSync<'a> {
         if self.store.get(&root_drive, &root_item.id)?.is_none() {
             self.store.upsert(&root_item)?;
         }
-        tracing::info!(drive = %drive.id, root = %root_item.id, sync_dir = %self.opts.sync_dir.display(), "starting download-only sync");
+        tracing::info!(drive = %drive.id, root = %root_item.id, sync_dir = %self.opts.sync_dir.display(), "applying online changes");
 
         let mut url = match self.store.delta_link(&root_drive, &root_item.id)? {
             Some(link) => link,
@@ -138,6 +155,12 @@ impl<'a> DownloadSync<'a> {
         if !is_safe_name(name) {
             return Err(Error::InvalidItem(item.id.clone(), "unusable file name"));
         }
+        // Like the D client, skip_file applies to downloads as well as uploads.
+        if item.is_file() && self.opts.skip_file.matches(name) {
+            tracing::debug!(id = %item.id, name, "skip_file match, not downloading");
+            self.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         let db = to_db_item(item, &self.drive_id)?;
         let rel = if parent_rel.is_empty() { name.to_owned() } else { format!("{parent_rel}/{name}") };
 
@@ -147,6 +170,10 @@ impl<'a> DownloadSync<'a> {
         let prev = self.store.get(&db.drive_id, &db.id)?;
         if let Some(prev) = &prev {
             self.apply_move(prev, &rel).await?;
+        }
+        if self.keep_local_deletions && is_local_deletion(prev.as_ref(), &db, local::stat(&self.local_path(&rel))?) {
+            tracing::debug!(path = %rel, "deleted locally, not restoring");
+            return Ok(self.store.upsert(&db)?);
         }
         match db.item_type {
             ItemType::Dir => self.apply_dir(db, &rel),
@@ -338,7 +365,7 @@ pub(crate) async fn hash_file(path: PathBuf) -> Result<String, Error> {
 }
 
 /// Download into `<path>.partial`, verify, set mtime, then atomically replace `path`.
-async fn download(graph: &Graph, item: &Item, path: &Path, mtime: OffsetDateTime, backup_device: Option<&str>) -> Result<u64, Error> {
+pub(crate) async fn download(graph: &Graph, item: &Item, path: &Path, mtime: OffsetDateTime, backup_device: Option<&str>) -> Result<u64, Error> {
     let partial = local::partial_path(path);
     let result = async {
         let (hash, size) = graph.download_to(&item.drive_id, &item.id, &partial).await?;

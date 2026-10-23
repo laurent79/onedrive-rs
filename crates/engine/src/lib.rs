@@ -114,7 +114,10 @@ pub async fn sync(graph: Arc<Graph>, store: &Store, opts: SyncOptions, stats: Ar
             None => drive.id,
         }
     } else {
-        DownloadSync::new(graph.clone(), store, opts.clone(), stats.clone()).run().await?
+        DownloadSync::new(graph.clone(), store, opts.clone(), stats.clone())
+            .keep_local_deletions(mode == SyncMode::Bidirectional)
+            .run()
+            .await?
     };
     if mode == SyncMode::Bidirectional {
         UploadSync::new(graph, store, opts, stats).run(&drive_id).await?;
