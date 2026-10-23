@@ -1,0 +1,9 @@
+# Copy to ~/.config/autostart/ to show the tray icon at login.
+[Desktop Entry]
+Type=Application
+Name=OneDrive
+Comment=OneDrive tray icon
+Exec=onedrive-rs gui --hidden
+Icon=io.github.onedrive_rs
+NoDisplay=true
+X-KDE-autostart-phase=2

@@ -1,0 +1,90 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: fr\n"
+"Plural-Forms: nplurals=2; plural=(n > 1);\n"
+
+msgid "Up to date"
+msgstr "À jour"
+
+msgid "Synchronising…"
+msgstr "Synchronisation…"
+
+msgid "Paused"
+msgstr "En pause"
+
+msgid "Error"
+msgstr "Erreur"
+
+msgid "Service not running"
+msgstr "Service arrêté"
+
+msgid "never"
+msgstr "jamais"
+
+msgid "just now"
+msgstr "à l'instant"
+
+msgid "Current pass"
+msgstr "Passe en cours"
+
+msgid "Last pass"
+msgstr "Dernière passe"
+
+msgid "Folder"
+msgstr "Dossier"
+
+msgid "Last success"
+msgstr "Dernière réussite"
+
+msgid "Items checked"
+msgstr "Éléments vérifiés"
+
+msgid "Downloaded"
+msgstr "Téléchargés"
+
+msgid "{} files ({} GiB)"
+msgstr "{} fichiers ({} Gio)"
+
+msgid "Unchanged"
+msgstr "Inchangés"
+
+msgid "Skipped"
+msgstr "Ignorés"
+
+msgid "Errors"
+msgstr "Erreurs"
+
+msgid "The onedrive-rs background service is not running. Start it to keep your files in sync."
+msgstr "Le service d'arrière-plan onedrive-rs ne tourne pas. Démarrez-le pour garder vos fichiers synchronisés."
+
+msgid "Start service"
+msgstr "Démarrer le service"
+
+msgid "Sync now"
+msgstr "Synchroniser"
+
+msgid "Resume"
+msgstr "Reprendre"
+
+msgid "Pause"
+msgstr "Pause"
+
+msgid "Open folder"
+msgstr "Ouvrir le dossier"
+
+msgid "Show window"
+msgstr "Afficher la fenêtre"
+
+msgid "Quit"
+msgstr "Quitter"
+
+msgid "{n} minute ago"
+msgid_plural "{n} minutes ago"
+msgstr[0] "il y a {n} minute"
+msgstr[1] "il y a {n} minutes"
+
+msgid "{n} hour ago"
+msgid_plural "{n} hours ago"
+msgstr[0] "il y a {n} heure"
+msgstr[1] "il y a {n} heures"
