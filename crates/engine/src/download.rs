@@ -397,7 +397,8 @@ pub(crate) async fn download(
         Ok(size)
     }
     .await;
-    if result.is_err() {
+    // Keep a partial download for resumption, unless its content is wrong.
+    if matches!(result, Err(Error::Integrity(_))) {
         let _ = std::fs::remove_file(&partial);
     }
     result

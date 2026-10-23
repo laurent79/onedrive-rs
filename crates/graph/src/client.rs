@@ -75,7 +75,14 @@ impl Graph {
             None => self.store.load()?.ok_or(Error::NotLoggedIn)?,
         };
         tracing::debug!("refreshing access token");
-        let fresh = auth::refresh(&self.http, &self.cfg, &refresh_token).await?;
+        let fresh = match auth::refresh(&self.http, &self.cfg, &refresh_token).await {
+            Ok(t) => t,
+            Err(e) => {
+                // Forget the cached token: after `onedrive-rs login` the next call reads the new one from disk.
+                *guard = None;
+                return Err(e);
+            }
+        };
         if fresh.refresh_token != refresh_token {
             self.store.save(&fresh.refresh_token)?;
         }
@@ -185,17 +192,31 @@ impl Graph {
         self.get_json(url).await
     }
 
-    /// Stream the content of a file into `dest` (created/truncated), returning
-    /// its QuickXorHash and size. The whole transfer is retried on failure.
+    /// Stream the content of a file into `dest`, returning its QuickXorHash and
+    /// size. Bytes already in `dest` (an earlier interrupted attempt or run) are
+    /// kept and the rest is requested with an HTTP `Range`; the hash always
+    /// covers the whole file, so a stale prefix is caught by the caller's check.
     pub async fn download_to(&self, drive_id: &str, item_id: &str, dest: &Path) -> Result<(String, u64)> {
         let url = format!("{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content");
+        let mut state = match tokio::fs::metadata(dest).await {
+            Ok(m) if m.is_file() && m.len() > 0 => {
+                let path = dest.to_owned();
+                tokio::task::spawn_blocking(move || odrs_quickxor::hash_file_state(&path))
+                    .await
+                    .map_err(std::io::Error::other)??
+            }
+            _ => (odrs_quickxor::QuickXor::new(), 0),
+        };
+        if state.1 > 0 {
+            tracing::debug!(item_id, offset = state.1, "resuming download");
+        }
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.download_once(&url, dest).await {
-                Ok(r) => return Ok(r),
+            match self.download_from(&url, dest, &mut state).await {
+                Ok(()) => return Ok((state.0.finish_base64(), state.1)),
                 Err(Error::Http(e)) if attempt < MAX_ATTEMPTS => {
-                    tracing::warn!(error = %e, item_id, attempt, "download interrupted, retrying");
+                    tracing::warn!(error = %e, item_id, attempt, offset = state.1, "download interrupted, resuming");
                     tokio::time::sleep(backoff(attempt)).await;
                 }
                 Err(e) => return Err(e),
@@ -203,21 +224,41 @@ impl Graph {
         }
     }
 
-    async fn download_once(&self, url: &str, dest: &Path) -> Result<(String, u64)> {
-        let resp = self.send(Method::GET, url, Ok).await?;
-        let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, tokio::fs::File::create(dest).await?);
-        let mut hasher = odrs_quickxor::QuickXor::new();
-        let mut size = 0u64;
+    /// One attempt from `state.1` bytes on. `state` always matches what is on disk.
+    async fn download_from(&self, url: &str, dest: &Path, state: &mut (odrs_quickxor::QuickXor, u64)) -> Result<()> {
+        let offset = state.1;
+        let resp = match self
+            .send(Method::GET, url, |r| Ok(if offset > 0 { r.header(header::RANGE, format!("bytes={offset}-")) } else { r }))
+            .await
+        {
+            Ok(r) => r,
+            // Nothing left to fetch: the caller's hash check decides whether the file is right.
+            Err(e) if offset > 0 && e.status() == Some(416) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let resumed = offset > 0
+            && resp.status() == StatusCode::PARTIAL_CONTENT
+            && resp
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with(&format!("bytes {offset}-")));
+        let mut file = if resumed {
+            tokio::fs::OpenOptions::new().append(true).open(dest).await?
+        } else {
+            // Fresh download (or the server ignored the range): start over.
+            *state = (odrs_quickxor::QuickXor::new(), 0);
+            tokio::fs::File::create(dest).await?
+        };
         let mut body = resp.bytes_stream();
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
-            hasher.update(&chunk);
-            size += chunk.len() as u64;
             file.write_all(&chunk).await?;
+            state.0.update(&chunk);
+            state.1 += chunk.len() as u64;
         }
-        file.flush().await?;
-        file.into_inner().sync_all().await?;
-        Ok((hasher.finish_base64(), size))
+        file.sync_all().await?;
+        Ok(())
     }
 }
 

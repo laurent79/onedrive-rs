@@ -23,6 +23,8 @@ pub struct Options {
     pub hidden: bool,
     /// Launch the background service when it is not running.
     pub start_daemon: Box<dyn Fn() -> std::io::Result<()>>,
+    /// Start an interactive (browser) login; the UI waits for it, then asks for a sync.
+    pub login: Box<dyn Fn() -> std::io::Result<std::process::Child>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +48,7 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
 
     let (tx, rx) = mpsc::unbounded_channel();
     let start_daemon = std::rc::Rc::new(opts.start_daemon);
+    let login = std::rc::Rc::new(opts.login);
 
     // Globals are per component instance: wire the window and the tray alike.
     macro_rules! wire {
@@ -71,6 +74,18 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
                     tracing::error!(error = %e, "could not start the daemon");
                 }
                 let _ = t.send(UiCommand::Refresh);
+            });
+            let (t, login) = (tx.clone(), login.clone());
+            logic.on_reconnect(move || match login() {
+                Ok(mut child) => {
+                    let t = t.clone();
+                    std::thread::spawn(move || {
+                        if child.wait().is_ok_and(|s| s.success()) {
+                            let _ = t.send(UiCommand::SyncNow);
+                        }
+                    });
+                }
+                Err(e) => tracing::error!(error = %e, "could not start the login"),
             });
             let w = window.as_weak();
             logic.on_show_window(move || {
@@ -158,7 +173,8 @@ fn to_status(s: Option<&Snapshot>) -> Status {
         state: s.state.as_str().into(),
         account: s.account.as_str().into(),
         sync_dir: s.sync_dir.as_str().into(),
-        last_error: s.last_error.as_str().into(),
+        last_error: s.last_error.trim_start_matches(odrs_ipc::AUTH_ERROR_PREFIX).trim().into(),
+        needs_login: s.last_error.starts_with(odrs_ipc::AUTH_ERROR_PREFIX),
         last_sync_mins: minutes_since(&s.last_sync).unwrap_or(-1),
         items: int(p.items),
         downloaded: int(p.downloaded),

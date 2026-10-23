@@ -9,6 +9,8 @@ use zbus::zvariant::{OwnedValue, Type, Value};
 
 pub const BUS_NAME: &str = "io.github.onedrive_rs.OneDrive1";
 pub const OBJECT_PATH: &str = "/io/github/onedrive_rs/OneDrive1";
+/// `LastError` starts with this when the stored login is no longer valid.
+pub const AUTH_ERROR_PREFIX: &str = "[login required]";
 
 pub use zbus::Error;
 pub type Result<T> = zbus::Result<T>;

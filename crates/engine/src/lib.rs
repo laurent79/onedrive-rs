@@ -38,6 +38,16 @@ pub enum Error {
 }
 
 impl Error {
+    /// Network unreachable (offline, DNS, timeout): worth retrying soon.
+    pub fn is_network(&self) -> bool {
+        matches!(self, Error::Graph(odrs_graph::Error::Http(e)) if e.is_connect() || e.is_timeout() || e.is_request())
+    }
+
+    /// The stored login is no longer valid: the user must run `onedrive-rs login`.
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Error::Graph(odrs_graph::Error::Auth(_) | odrs_graph::Error::NotLoggedIn))
+    }
+
     /// Errors that must stop the whole sync rather than just the current item.
     pub fn is_fatal(&self) -> bool {
         match self {
@@ -105,6 +115,8 @@ pub struct Stats {
     pub folders_created_online: AtomicU64,
     pub deleted_online: AtomicU64,
     pub moved_online: AtomicU64,
+    /// Uploads postponed because the file was modified a moment ago.
+    pub deferred: AtomicU64,
     /// Files changed both locally and online, kept as safeBackup.
     pub conflicts: AtomicU64,
 }

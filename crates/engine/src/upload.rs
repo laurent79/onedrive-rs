@@ -36,6 +36,9 @@ enum Outcome {
     Conflict(Item),
 }
 
+/// A file modified less than this many seconds ago is not uploaded yet.
+const STABLE_AFTER_SECS: i64 = 10;
+
 struct Uploaded {
     rel: String,
     result: Result<Outcome, Error>,
@@ -385,6 +388,13 @@ impl<'a> UploadSync<'a> {
 
     async fn spawn_upload(&mut self, target: UploadTarget, rel: String, size: u64, mtime: i64) -> Result<(), Error> {
         let kind = if matches!(target, UploadTarget::New { .. }) { "new" } else { "modified" };
+        let age = OffsetDateTime::now_utc().unix_timestamp() - mtime;
+        if !self.opts.dry_run && (0..STABLE_AFTER_SECS).contains(&age) {
+            // Probably still being written: the next pass (scheduled soon by the daemon) takes it.
+            tracing::debug!(path = %rel, age, "modified just now, deferring upload");
+            self.stats.deferred.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         tracing::info!(path = %rel, size, kind, dry_run = self.opts.dry_run, "uploading");
         if self.opts.dry_run {
             self.stats.uploaded.fetch_add(1, Ordering::Relaxed);

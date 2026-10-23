@@ -86,18 +86,26 @@ impl QuickXor {
 
 /// Hash a whole file from disk without loading it into memory.
 pub fn hash_file(path: &std::path::Path) -> std::io::Result<String> {
+    Ok(hash_file_state(path)?.0.finish_base64())
+}
+
+/// Hasher state after reading `path`, and the number of bytes read: lets an
+/// interrupted download resume while still hashing the whole content.
+pub fn hash_file_state(path: &std::path::Path) -> std::io::Result<(QuickXor, u64)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = QuickXor::new();
     let mut buf = vec![0u8; 256 * 1024];
+    let mut len = 0u64;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        len += n as u64;
     }
-    Ok(hasher.finish_base64())
+    Ok((hasher, len))
 }
 
 #[cfg(test)]

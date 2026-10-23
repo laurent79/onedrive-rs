@@ -201,7 +201,8 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     if let Command::Gui { hidden } = cli.command {
         // The UI event loop owns this thread; async D-Bus work runs on the runtime's workers.
-        let opts = odrs_gui::Options { hidden, start_daemon: Box::new(spawn_daemon) };
+        let login = || std::process::Command::new(std::env::current_exe()?).arg("login").stdin(std::process::Stdio::null()).spawn();
+        let opts = odrs_gui::Options { hidden, start_daemon: Box::new(spawn_daemon), login: Box::new(login) };
         return Ok(odrs_gui::run(rt.handle().clone(), opts)?);
     }
     rt.block_on(run(cli.command, paths, cfg, auth))

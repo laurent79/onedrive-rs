@@ -7,6 +7,8 @@ export struct Status {
     account: string,
     sync-dir: string,
     last-error: string,
+    // The stored login expired: offer to sign in again.
+    needs-login: bool,
     // Minutes since the last successful pass, -1 if never.
     last-sync-mins: int,
     items: int,
@@ -23,6 +25,7 @@ export global Logic {
     callback toggle-pause();
     callback open-folder();
     callback start-daemon();
+    callback reconnect();
     callback show-window();
     callback quit();
 }
@@ -118,6 +121,11 @@ export component MainWindow inherits Window {
         HorizontalBox {
             padding: 0;
             alignment: end;
+            if status.needs-login: Button {
+                text: @tr("Sign in again");
+                primary: true;
+                clicked => { Logic.reconnect(); }
+            }
             if status.state == "stopped": Button {
                 text: @tr("Start service");
                 primary: true;
@@ -155,6 +163,7 @@ export component Tray inherits SystemTrayIcon {
     Menu {
         MenuItem { title: Fmt.state-label(status.state); enabled: false; }
         MenuItem { title: @tr("Show window"); activated => { Logic.show-window(); } }
+        if status.needs-login: MenuItem { title: @tr("Sign in again"); activated => { Logic.reconnect(); } }
         MenuSeparator { }
         MenuItem {
             title: @tr("Sync now");

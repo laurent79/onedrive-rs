@@ -16,6 +16,10 @@ use tokio::sync::mpsc;
 use crate::Paths;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+/// Retry delay after a pass failed for lack of network.
+const OFFLINE_RETRY: Duration = Duration::from_secs(60);
+/// Prefix of `LastError` when the login expired (see `odrs_ipc::AUTH_ERROR_PREFIX`).
+use odrs_ipc::AUTH_ERROR_PREFIX;
 /// Quiet time after a local change before starting a pass.
 const DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -123,11 +127,25 @@ pub async fn run(paths: &Paths, auth: AuthConfig, opts: SyncOptions, mode: SyncM
             }
             Some(Err(e)) => {
                 tracing::error!(error = %e, "sync pass failed");
-                server.finish_pass(Err(e.to_string())).await?;
+                let msg = if e.is_auth() {
+                    // Recognised by the GUI, which then offers to sign in again.
+                    format!("{AUTH_ERROR_PREFIX} {e}")
+                } else {
+                    e.to_string()
+                };
+                server.finish_pass(Err(msg)).await?;
                 server.set_state(State::Error).await?;
+                if e.is_network() {
+                    next = Instant::now() + OFFLINE_RETRY;
+                    continue;
+                }
             }
         }
         next = Instant::now() + interval;
+        if stats.deferred.load(Ordering::Relaxed) > 0 {
+            // Files that were still being written: pick them up shortly.
+            next = next.min(Instant::now() + 2 * DEBOUNCE);
+        }
     }
     tracing::info!("daemon stopping");
     Ok(())
