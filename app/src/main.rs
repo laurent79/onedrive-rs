@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use odrs_store::Store;
 mod config;
 mod daemon;
 mod import;
+mod verify;
 
 #[derive(Parser)]
 #[command(name = "onedrive-rs", version, about = "Microsoft OneDrive client for Linux")]
@@ -54,16 +55,19 @@ enum Command {
     },
     /// Show account and database status.
     Status,
-    /// Hash every file recorded in a database and compare with a local tree.
-    #[command(hide = true)]
+    /// Hash the files recorded in the database and compare them with the local
+    /// folders (read-only; the daemon may keep running).
     Verify {
-        /// Database to read (default: our own). Copy a locked D client DB first.
-        #[arg(long)]
+        /// Only these drives: `main` or a [drive "name"] from the config. Repeatable.
+        #[arg(long = "drive", value_name = "NAME", conflicts_with = "db")]
+        drives: Vec<String>,
+        /// Another database, e.g. a copy of a D client's (it is locked while D runs).
+        #[arg(long, requires = "dir")]
         db: Option<PathBuf>,
-        /// Local root the database describes (default: our sync dir).
-        #[arg(long)]
+        /// Local folder that --db describes.
+        #[arg(long, requires = "db")]
         dir: Option<PathBuf>,
-        /// Stop after this many files.
+        /// Check at most this many files per drive.
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -282,12 +286,16 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             sync(&paths, auth, targets, mode).await
         }
         Command::Status => status(&paths, auth).await,
-        Command::Verify { db, dir, limit } => {
-            let dir = match dir.or_else(|| cfg.sync_dir.clone()) {
-                Some(d) => d,
-                None => default_sync_dir()?,
-            };
-            verify(&db.unwrap_or_else(|| paths.db()), &dir, limit)
+        Command::Verify { drives, db, dir, limit } => {
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));
+            if let (Some(db), Some(dir)) = (db, dir) {
+                let tree = verify::Tree { name: db.display().to_string(), drive_id: None, dir };
+                return verify::run(&Store::open(&db)?, &[tree], limit, threads);
+            }
+            let (targets, _) = SyncArgs { mode: None, sync_dir: None, transfers: None, drives }.resolve(&cfg)?;
+            let store = Store::open(&paths.db())?;
+            let libraries: Vec<String> = cfg.drives.iter().map(|d| d.drive_id.clone()).collect();
+            verify::run(&store, &verify::trees(&store, &targets, &libraries)?, limit, threads)
         }
         Command::Daemon { args, interval } => {
             let (targets, mode) = args.resolve(&cfg)?;
@@ -485,34 +493,5 @@ async fn account_status(auth: AuthConfig, paths: &Paths) -> Result<()> {
         Err(odrs_graph::Error::NotLoggedIn) => println!("Account:    not logged in"),
         Err(e) => return Err(e.into()),
     }
-    Ok(())
-}
-
-fn verify(db: &Path, dir: &Path, limit: Option<usize>) -> Result<()> {
-    let store = Store::open(db)?;
-    let (mut ok, mut missing, mut mismatched, mut no_hash) = (0usize, 0usize, 0usize, 0usize);
-    let mut files = Vec::new();
-    store.for_each_file(|item| files.push(item))?;
-    for item in files.into_iter().take(limit.unwrap_or(usize::MAX)) {
-        let Some(rel) = store.path_of(&item.drive_id, &item.id)? else { continue };
-        let Some(expected) = &item.quick_xor_hash else {
-            no_hash += 1;
-            continue;
-        };
-        let path = dir.join(&rel);
-        match odrs_quickxor::hash_file(&path) {
-            Ok(h) if &h == expected => ok += 1,
-            Ok(h) => {
-                mismatched += 1;
-                println!("MISMATCH {rel}: local {h}, db {expected}");
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                missing += 1;
-                println!("MISSING  {rel}");
-            }
-            Err(e) => return Err(e).with_context(|| format!("hashing {}", path.display())),
-        }
-    }
-    println!("{ok} identical, {mismatched} different, {missing} missing, {no_hash} without QuickXorHash");
     Ok(())
 }

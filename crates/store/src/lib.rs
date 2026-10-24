@@ -366,10 +366,23 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Visit every file item (used for verification against a local tree).
-    pub fn for_each_file(&self, mut f: impl FnMut(Item)) -> Result<()> {
-        let mut stmt = self.conn.prepare(&format!("SELECT {COLUMNS} FROM item WHERE type = 'file'"))?;
+    /// Root rows: one per drive in the database.
+    pub fn roots(&self) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(&format!("SELECT {COLUMNS} FROM item WHERE type = 'root' ORDER BY driveId"))?;
         let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Item::from_row(row)?);
+        }
+        Ok(out)
+    }
+
+    /// Visit every file item, of one drive or of all (used for verification
+    /// against a local tree).
+    pub fn for_each_file(&self, drive_id: Option<&str>, mut f: impl FnMut(Item)) -> Result<()> {
+        let mut stmt =
+            self.conn.prepare(&format!("SELECT {COLUMNS} FROM item WHERE type = 'file' AND (?1 IS NULL OR driveId = ?1)"))?;
+        let mut rows = stmt.query(params![drive_id])?;
         while let Some(row) = rows.next()? {
             f(Item::from_row(row)?);
         }
@@ -426,6 +439,18 @@ mod tests {
 
         s.set_delta_link("D", "R", Some("link")).unwrap();
         assert_eq!(s.delta_link("D", "R").unwrap().as_deref(), Some("link"));
+
+        let mut other = item("G", "b.txt", ItemType::File, None);
+        other.drive_id = "E".into();
+        s.upsert(&other).unwrap();
+        let count = |drive| {
+            let mut n = 0;
+            s.for_each_file(drive, |_| n += 1).unwrap();
+            n
+        };
+        assert_eq!((count(None), count(Some("D")), count(Some("E"))), (2, 1, 1));
+        assert_eq!(s.roots().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["R"]);
+        s.delete("E", "G").unwrap();
 
         assert_eq!(s.count_descendants("D", "R").unwrap(), 2);
         assert_eq!(s.count_descendants("D", "F").unwrap(), 0);

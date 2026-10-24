@@ -101,7 +101,10 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 - `cargo test` ; scénarios d'upload sans réseau : `crates/engine/tests/upload_dry_run.rs` (mode dry-run).
 - `cargo run -p odrs-ipc --example mock_daemon` : faux daemon (drives, sites) pour travailler la GUI.
 - `cargo run -p odrs-graph --example download -- <refresh_token> <drive> <item> <dest>` : test de reprise.
-- `onedrive-rs verify [--db] [--dir]` (caché) : recalcule les QuickXorHash d'une DB contre un arbre local.
+- `onedrive-rs verify [--drive NAME] [--limit N]` : recalcule les QuickXorHash de chaque drive contre son dossier
+  (lecture seule, daemon actif possible ; code de sortie 1 si fichier modifié/absent/illisible). Fichier au
+  mtime de la DB mais au contenu différent = en sync pour D (Office enrichi par SharePoint), compté à part.
+  `--db <copie> --dir <dossier>` : vérifie une autre DB (ex. celle du client D).
 - Pour inspecter une DB du client D en cours d'exécution : la copier (`items.sqlite3*`), elle est verrouillée.
 - Tests d'écriture sur un vrai compte : uniquement dans un dossier bac à sable, supprimé ensuite.
 
@@ -109,7 +112,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : `verify`/resync pour tous les drives, notifications bureau, changements en ligne quasi
+- À faire : `verify` depuis le daemon/la GUI, resync d'un drive, notifications bureau, changements en ligne quasi
   instantanés (webhooks/WebSocket), sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
   uploads en session après redémarrage, progression des envois, application Entra dédiée, paquet RPM.
 
