@@ -104,15 +104,6 @@ msgstr "En attente de sa première passe"
 msgid "Up to date, last sync {}"
 msgstr "À jour, dernière synchro {}"
 
-msgid "Open"
-msgstr "Ouvrir"
-
-msgid "Confirm removal"
-msgstr "Confirmer le retrait"
-
-msgid "Remove"
-msgstr "Retirer"
-
 msgid "Add a library…"
 msgstr "Ajouter une bibliothèque…"
 
@@ -164,3 +155,71 @@ msgid "about {n} hour left"
 msgid_plural "about {n} hours left"
 msgstr[0] "environ {n} heure restante"
 msgstr[1] "environ {n} heures restantes"
+
+msgid "Integrity check waiting"
+msgstr "Vérification en attente"
+
+msgid "Checking files: {} of {}"
+msgstr "Vérification des fichiers : {} sur {}"
+
+msgid "Integrity check stopped"
+msgstr "Vérification arrêtée"
+
+msgid "Integrity check failed: {}"
+msgstr "Vérification impossible : {}"
+
+msgid "Checked {}"
+msgstr "Vérifié {}"
+
+msgid "{n} file needs attention"
+msgid_plural "{n} files need attention"
+msgstr[0] "{n} fichier à examiner"
+msgstr[1] "{n} fichiers à examiner"
+
+msgid "all files intact"
+msgstr "tous les fichiers sont intacts"
+
+msgid "Details…"
+msgstr "Détails…"
+
+msgid "Integrity check — {}"
+msgstr "Vérification — {}"
+
+msgid "These files differ from what was last synchronised. A modified file may simply be a local change not uploaded yet; a missing file may have been deleted on purpose. Nothing was changed on disk or online."
+msgstr "Ces fichiers diffèrent de leur dernier état synchronisé. Un fichier modifié peut simplement être une modification locale pas encore envoyée ; un fichier absent a peut-être été supprimé volontairement. Rien n'a été modifié, ni sur le disque ni en ligne."
+
+msgid "Show in folder"
+msgstr "Afficher dans le dossier"
+
+msgid "Check again"
+msgstr "Vérifier à nouveau"
+
+msgid "Close"
+msgstr "Fermer"
+
+msgid "Check all files"
+msgstr "Vérifier tous les fichiers"
+
+msgid "Modified"
+msgstr "Modifié"
+
+msgid "Missing"
+msgstr "Absent"
+
+msgid "Unreadable"
+msgstr "Illisible"
+
+msgid "Open"
+msgstr "Ouvrir"
+
+msgid "Remove"
+msgstr "Retirer"
+
+msgid "Confirm removal"
+msgstr "Confirmer le retrait"
+
+msgid "Stop check"
+msgstr "Arrêter la vérification"
+
+msgid "Check"
+msgstr "Vérifier"

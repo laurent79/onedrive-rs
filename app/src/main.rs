@@ -12,6 +12,7 @@ use odrs_store::Store;
 mod config;
 mod daemon;
 mod import;
+mod verifier;
 mod verify;
 
 #[derive(Parser)]

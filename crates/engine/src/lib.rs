@@ -8,6 +8,7 @@ pub mod filter;
 pub mod local;
 pub mod moves;
 mod upload;
+pub mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;

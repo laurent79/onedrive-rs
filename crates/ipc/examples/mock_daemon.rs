@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use odrs_ipc::{BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State};
+use odrs_ipc::{BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State, VerifyFinding, VerifyStatus};
 use tokio::sync::mpsc;
 
 #[tokio::main(flavor = "current_thread")]
@@ -31,7 +31,11 @@ async fn main() -> odrs_ipc::Result<()> {
                 }
                 None => return Ok(()),
             },
+            _ = tokio::time::sleep(Duration::from_millis(500)), if paused => {
+                server.set_verifications(manager.advance_verifications()).await?;
+            }
             _ = tokio::time::sleep(Duration::from_millis(500)), if !paused => {
+                server.set_verifications(manager.advance_verifications()).await?;
                 progress.items += 37;
                 progress.downloaded += 11;
                 progress.unchanged += 26;
@@ -52,9 +56,47 @@ async fn main() -> odrs_ipc::Result<()> {
 #[derive(Default)]
 struct Mock {
     added: Mutex<Vec<(String, String, String)>>,
+    verifications: Mutex<Vec<VerifyStatus>>,
+}
+
+/// `main` always ends with a few problems, to show the report.
+fn fake_findings() -> Vec<VerifyFinding> {
+    vec![
+        VerifyFinding { kind: "modified".into(), path: "/tmp/OneDrive/Documents/report.docx".into(), detail: "local AAAA, database BBBB".into() },
+        VerifyFinding { kind: "missing".into(), path: "/tmp/OneDrive/Pictures/2024/holiday.jpg".into(), detail: String::new() },
+        VerifyFinding { kind: "error".into(), path: "/tmp/OneDrive/Private/locked.pdf".into(), detail: "Permission denied (os error 13)".into() },
+    ]
 }
 
 impl Mock {
+    fn names(&self) -> Vec<String> {
+        std::iter::once("main".to_owned()).chain(self.added.lock().unwrap().iter().map(|(n, ..)| n.clone())).collect()
+    }
+
+    /// One step of the simulated checks: the first queued one runs.
+    fn advance_verifications(&self) -> Vec<VerifyStatus> {
+        let mut v = self.verifications.lock().unwrap();
+        if !v.iter().any(|s| s.state == "running")
+            && let Some(s) = v.iter_mut().find(|s| s.state == "queued")
+        {
+            s.state = "running".into();
+        }
+        if let Some(s) = v.iter_mut().find(|s| s.state == "running") {
+            s.done = (s.done + 450).min(s.total);
+            s.bytes += 900 << 20;
+            s.identical = s.done;
+            if s.done == s.total {
+                s.state = "done".into();
+                s.finished = "2026-10-24T21:00:00Z".into();
+                if s.name == "main" {
+                    (s.modified, s.missing, s.errors, s.same_mtime) = (1, 1, 1, 2);
+                    s.identical -= 5;
+                }
+            }
+        }
+        v.clone()
+    }
+
     fn statuses(&self, progress: Progress) -> Vec<DriveStatus> {
         let mut out = vec![DriveStatus {
             name: "main".into(),
@@ -109,6 +151,32 @@ impl DriveManager for Mock {
 
     fn remove_drive(&self, name: String) -> Result<(), String> {
         self.added.lock().unwrap().retain(|(n, ..)| n != &name);
+        self.verifications.lock().unwrap().retain(|s| s.name != name);
         Ok(())
+    }
+
+    fn verify(&self, name: String) -> Result<(), String> {
+        let names = if name.is_empty() { self.names() } else { vec![name] };
+        let mut v = self.verifications.lock().unwrap();
+        for name in names {
+            v.retain(|s| s.name != name);
+            v.push(VerifyStatus { name, state: "queued".into(), total: 6000, ..Default::default() });
+        }
+        Ok(())
+    }
+
+    fn cancel_verify(&self, name: String) -> Result<(), String> {
+        for s in self.verifications.lock().unwrap().iter_mut() {
+            if (name.is_empty() || s.name == name) && (s.state == "queued" || s.state == "running") {
+                s.state = "cancelled".into();
+                s.finished = "2026-10-24T21:00:00Z".into();
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_report(&self, name: String) -> Result<Vec<VerifyFinding>, String> {
+        let v = self.verifications.lock().unwrap();
+        Ok(if name == "main" && v.iter().any(|s| s.name == "main" && s.state == "done") { fake_findings() } else { Vec::new() })
     }
 }

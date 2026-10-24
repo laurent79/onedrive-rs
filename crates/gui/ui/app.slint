@@ -38,6 +38,17 @@ export struct DriveRow {
     rate-mbs: float,
     // Estimated minutes left, -1 if unknown.
     eta-mins: int,
+    // Integrity check: "" (never) | "queued" | "running" | "done" | "cancelled" | "failed"
+    verify-state: string,
+    verify-done: int,
+    verify-total: int,
+    // 0..1
+    verify-fraction: float,
+    // Files missing, modified or unreadable.
+    verify-problems: int,
+    // Minutes since it ended, -1 if unknown.
+    verify-mins: int,
+    verify-message: string,
 }
 
 export global Logic {
@@ -45,6 +56,10 @@ export global Logic {
     callback toggle-pause();
     callback open-folder(string);
     callback remove-drive(string);
+    // Drive name, empty for every drive.
+    callback verify(string);
+    callback cancel-verify(string);
+    callback show-report(string);
     callback add-library();
     callback start-daemon();
     callback reconnect();
@@ -61,7 +76,14 @@ component StateIcon inherits Image {
         : @image-url("../icons/stopped.png");
 }
 
-global Fmt {
+export global Fmt {
+    // Kind of a verification finding, as listed in the report.
+    public pure function finding-kind(kind: string) -> string {
+        if kind == "modified" { return @tr("Modified"); }
+        if kind == "missing" { return @tr("Missing"); }
+        return @tr("Unreadable");
+    }
+
     public pure function state-label(state: string) -> string {
         if state == "idle" { return @tr("Up to date"); }
         if state == "syncing" { return @tr("Synchronising…"); }
@@ -89,6 +111,20 @@ global Fmt {
         let rate = @tr("{} MB/s", round(d.rate-mbs * 10) / 10);
         if d.eta-mins < 0 { return amount + " · " + rate; }
         return amount + " · " + rate + " · " + self.eta-label(d.eta-mins);
+    }
+
+    public pure function verify-label(d: DriveRow) -> string {
+        if d.verify-state == "queued" { return @tr("Integrity check waiting"); }
+        if d.verify-state == "running" {
+            return @tr("Checking files: {} of {}", d.verify-done, d.verify-total);
+        }
+        if d.verify-state == "cancelled" { return @tr("Integrity check stopped"); }
+        if d.verify-state == "failed" { return @tr("Integrity check failed: {}", d.verify-message); }
+        let when = @tr("Checked {}", self.last-sync-label(d.verify-mins));
+        if d.verify-problems > 0 {
+            return when + " · " + @tr("{n} file needs attention" | "{n} files need attention" % d.verify-problems);
+        }
+        return when + " · " + @tr("all files intact");
     }
 
     public pure function drive-detail(d: DriveRow) -> string {
@@ -133,6 +169,22 @@ component DriveView inherits Rectangle {
                 color: drive.state == "error" ? #c62828 : Palette.alternate-foreground.transparentize(20%);
                 wrap: word-wrap;
             }
+            if drive.verify-state != "": HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: Fmt.verify-label(drive);
+                    font-size: 11px;
+                    color: drive.verify-state == "failed" || drive.verify-problems > 0 ? #e65100 : Palette.alternate-foreground.transparentize(20%);
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+                if drive.verify-state == "done" && drive.verify-problems > 0: Button {
+                    text: @tr("Details…");
+                    clicked => { Logic.show-report(drive.name); }
+                }
+            }
+            if drive.verify-state == "running": ProgressIndicator { progress: drive.verify-fraction; height: 4px; }
             if drive.show-progress: VerticalLayout {
                 spacing: 2px;
                 padding-top: 4px;
@@ -151,6 +203,15 @@ component DriveView inherits Rectangle {
             Button {
                 text: @tr("Open");
                 clicked => { Logic.open-folder(drive.sync-dir); }
+            }
+            if drive.verify-state == "queued" || drive.verify-state == "running": Button {
+                text: @tr("Stop check");
+                clicked => { Logic.cancel-verify(drive.name); }
+            }
+            if drive.verify-state != "queued" && drive.verify-state != "running": Button {
+                text: @tr("Check");
+                enabled: drive.state != "pending";
+                clicked => { Logic.verify(drive.name); }
             }
             if drive.removable: Button {
                 text: root.confirm ? @tr("Confirm removal") : @tr("Remove");
@@ -340,6 +401,59 @@ export component AddLibraryWindow inherits Window {
     }
 }
 
+// Files that need attention after an integrity check of one drive.
+export component ReportWindow inherits Window {
+    // Drive name for commands, and its displayed title.
+    in property <string> drive-name;
+    in property <string> drive-title;
+    // Shown as "Kind — path".
+    in property <[StandardListViewItem]> items;
+    // Absolute paths matching `items`, used by Rust.
+    in property <[string]> paths;
+    in property <bool> busy;
+    in-out property <int> current: -1;
+    callback show-item(int);
+    callback check-again();
+    callback dismiss();
+
+    title: @tr("Integrity check — {}", root.drive-title);
+    icon: @image-url("../icons/app.png");
+    preferred-width: 640px;
+    min-width: 420px;
+    min-height: 360px;
+
+    VerticalBox {
+        Text {
+            text: @tr("These files differ from what was last synchronised. A modified file may simply be a local change not uploaded yet; a missing file may have been deleted on purpose. Nothing was changed on disk or online.");
+            wrap: word-wrap;
+        }
+        StandardListView {
+            model: root.items;
+            current-item <=> root.current;
+            vertical-stretch: 1;
+        }
+        HorizontalBox {
+            padding: 0;
+            if root.busy: Spinner { indeterminate: true; width: 18px; height: 18px; }
+            Button {
+                text: @tr("Show in folder");
+                enabled: root.current >= 0;
+                clicked => { root.show-item(root.current); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: @tr("Check again");
+                clicked => { root.check-again(); }
+            }
+            Button {
+                text: @tr("Close");
+                primary: true;
+                clicked => { root.dismiss(); }
+            }
+        }
+    }
+}
+
 export component Tray inherits SystemTrayIcon {
     in property <Status> status;
     icon: status.state == "idle" ? @image-url("../icons/idle.png")
@@ -367,6 +481,11 @@ export component Tray inherits SystemTrayIcon {
             activated => { Logic.toggle-pause(); }
         }
         MenuItem { title: @tr("Open folder"); enabled: status.sync-dir != ""; activated => { Logic.open-folder(status.sync-dir); } }
+        MenuItem {
+            title: @tr("Check all files");
+            enabled: status.state != "stopped";
+            activated => { Logic.verify(""); }
+        }
         MenuSeparator { }
         MenuItem { title: @tr("Quit"); activated => { Logic.quit(); } }
     }

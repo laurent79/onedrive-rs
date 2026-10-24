@@ -59,6 +59,10 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
 - Permissions : dossiers 0700, fichiers 0600 (défauts D).
 - Daemon : intervalle 300 s ; inotify (bidirectionnel) → passe 5 s après le dernier changement ; hors ligne →
   nouvelle passe après 60 s ; login expiré → `LastError` préfixé `AUTH_ERROR_PREFIX` (bouton GUI).
+- Vérification d'intégrité (`odrs_engine::verify`, CLI `verify` et D-Bus `Verify`/`CancelVerify`/`VerifyReport`,
+  propriété `Verifications`) : lecture seule, un drive à la fois à côté des passes (2 threads, connexion SQLite
+  propre) ; écarts revérifiés à la fin (ligne DB changée = la synchro est passée par là → ignoré). Dernier
+  résultat par drive dans `verify.json` (dossier de config), 1000 écarts max.
 
 ## Faits extraits du client D
 
@@ -112,7 +116,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : `verify` depuis le daemon/la GUI, resync d'un drive, notifications bureau, changements en ligne quasi
+- À faire : resync d'un drive, notifications bureau, changements en ligne quasi
   instantanés (webhooks/WebSocket), sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
   uploads en session après redémarrage, progression des envois, application Entra dédiée, paquet RPM.
 

@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use odrs_ipc::{Client, DriveStatus, Snapshot};
+use odrs_ipc::{Client, DriveStatus, Snapshot, VerifyFinding, VerifyStatus};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
 use tokio::sync::mpsc;
 
@@ -39,6 +39,10 @@ enum UiCommand {
     SearchSites(String),
     ListLibraries(String),
     AddDrive { name: String, drive_id: String, sync_dir: String },
+    Verify(String),
+    CancelVerify(String),
+    /// Fetch the findings of a drive's last check and show them.
+    ShowReport(String),
 }
 
 /// Run the UI on the current thread until the user quits from the tray menu.
@@ -50,6 +54,7 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     slint::set_xdg_app_id(APP_ID)?;
     let tray = Tray::new()?;
     let add = AddLibraryWindow::new()?;
+    let report = ReportWindow::new()?;
     let initial = to_status(None);
     window.set_status(initial.clone());
     tray.set_status(initial);
@@ -76,6 +81,18 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
             let t = tx.clone();
             logic.on_remove_drive(move |name| {
                 let _ = t.send(UiCommand::RemoveDrive(name.into()));
+            });
+            let t = tx.clone();
+            logic.on_verify(move |name| {
+                let _ = t.send(UiCommand::Verify(name.into()));
+            });
+            let t = tx.clone();
+            logic.on_cancel_verify(move |name| {
+                let _ = t.send(UiCommand::CancelVerify(name.into()));
+            });
+            let t = tx.clone();
+            logic.on_show_report(move |name| {
+                let _ = t.send(UiCommand::ShowReport(name.into()));
             });
             let (a, t) = (add.as_weak(), tx.clone());
             logic.on_add_library(move || {
@@ -116,8 +133,9 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     wire!(window);
     wire!(tray);
     wire_add_window(&add, &tx);
+    wire_report_window(&report, &tx, &rt);
 
-    rt.spawn(poll(rx, window.as_weak(), tray.as_weak(), add.as_weak()));
+    rt.spawn(poll(rx, window.as_weak(), tray.as_weak(), add.as_weak(), report.as_weak()));
 
     if !opts.hidden {
         window.show()?;
@@ -190,6 +208,70 @@ fn wire_add_window(add: &AddLibraryWindow, tx: &mpsc::UnboundedSender<UiCommand>
     });
 }
 
+fn wire_report_window(report: &ReportWindow, tx: &mpsc::UnboundedSender<UiCommand>, rt: &tokio::runtime::Handle) {
+    let (r, rt) = (report.as_weak(), rt.clone());
+    report.on_show_item(move |i| {
+        let Some(r) = r.upgrade() else { return };
+        if let Some(path) = usize::try_from(i).ok().and_then(|i| r.get_paths().row_data(i)) {
+            rt.spawn(show_in_folder(path.into()));
+        }
+    });
+    let (r, t) = (report.as_weak(), tx.clone());
+    report.on_check_again(move || {
+        let Some(r) = r.upgrade() else { return };
+        let _ = t.send(UiCommand::Verify(r.get_drive_name().into()));
+        let _ = r.hide();
+    });
+    let r = report.as_weak();
+    report.on_dismiss(move || {
+        if let Some(r) = r.upgrade() {
+            let _ = r.hide();
+        }
+    });
+}
+
+/// Select the file in the file manager (Dolphin, Nautilus... through
+/// `org.freedesktop.FileManager1`), or open its folder; a missing file's folder.
+async fn show_in_folder(path: String) {
+    let p = std::path::Path::new(&path);
+    if p.exists() {
+        let shown = async {
+            let conn = zbus::Connection::session().await?;
+            conn.call_method(
+                Some("org.freedesktop.FileManager1"),
+                "/org/freedesktop/FileManager1",
+                Some("org.freedesktop.FileManager1"),
+                "ShowItems",
+                &(vec![file_uri(p)], ""),
+            )
+            .await?;
+            zbus::Result::Ok(())
+        };
+        match shown.await {
+            Ok(()) => return,
+            Err(e) => tracing::debug!(error = %e, "FileManager1.ShowItems failed"),
+        }
+    }
+    // The nearest folder that still exists.
+    if let Some(dir) = p.ancestors().skip(1).find(|d| d.is_dir()) {
+        open_folder(&dir.display().to_string());
+    }
+}
+
+/// `file://` URI with the path percent-encoded (RFC 8089).
+fn file_uri(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut uri = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
+}
+
 /// "Documents" is the default library of every site: name it after the site.
 fn default_name(site: &str, library: &str) -> String {
     let generic = ["documents", "shared documents", "documents partagés", "documents partages", "gedeelde documenten"];
@@ -208,6 +290,7 @@ async fn poll(
     window: slint::Weak<MainWindow>,
     tray: slint::Weak<Tray>,
     add: slint::Weak<AddLibraryWindow>,
+    report: slint::Weak<ReportWindow>,
 ) {
     let client = loop {
         match Client::new().await {
@@ -226,7 +309,7 @@ async fn poll(
             _ = tick.tick() => {}
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return };
-                handle(&client, cmd, last.as_ref(), &add).await;
+                handle(&client, cmd, last.as_ref(), &add, &report).await;
             }
         }
         let snapshot = match client.snapshot().await {
@@ -237,8 +320,15 @@ async fn poll(
             }
         };
         let status = to_status(snapshot.as_ref());
-        let rows: Vec<DriveRow> =
-            snapshot.as_ref().map(|s| s.drives.iter().map(|d| to_row(d, rates.sample(d))).collect()).unwrap_or_default();
+        let rows: Vec<DriveRow> = snapshot
+            .as_ref()
+            .map(|s| {
+                s.drives
+                    .iter()
+                    .map(|d| to_row(d, rates.sample(d), s.verifications.iter().find(|v| v.name == d.name)))
+                    .collect()
+            })
+            .unwrap_or_default();
         last = snapshot;
         let s = status.clone();
         let _ = window.upgrade_in_event_loop(move |w| {
@@ -257,7 +347,13 @@ async fn poll(
     }
 }
 
-async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>, add: &slint::Weak<AddLibraryWindow>) {
+async fn handle(
+    client: &Client,
+    cmd: UiCommand,
+    last: Option<&Snapshot>,
+    add: &slint::Weak<AddLibraryWindow>,
+    report_window: &slint::Weak<ReportWindow>,
+) {
     let d = client.daemon();
     match cmd {
         UiCommand::SyncNow => report(d.sync_now().await, "sync now"),
@@ -265,6 +361,27 @@ async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>, add: &
         UiCommand::TogglePause => report(d.pause().await, "pause"),
         UiCommand::Refresh => {}
         UiCommand::RemoveDrive(name) => report(d.remove_drive(&name).await, "remove drive"),
+        UiCommand::Verify(name) => report(d.verify(&name).await, "verify"),
+        UiCommand::CancelVerify(name) => report(d.cancel_verify(&name).await, "cancel verify"),
+        UiCommand::ShowReport(name) => {
+            let title = if name == "main" { "OneDrive".to_owned() } else { name.clone() };
+            let findings = match d.verify_report(&name).await {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot read the verification report");
+                    return;
+                }
+            };
+            let _ = report_window.upgrade_in_event_loop(move |r| {
+                r.set_drive_name(name.into());
+                r.set_drive_title(title.into());
+                r.set_current(-1);
+                let labels: Vec<String> = findings.iter().map(|f| finding_label(&r, f)).collect();
+                r.set_items(list(labels.iter().map(String::as_str)));
+                r.set_paths(strings(findings.iter().map(|f| f.path.as_str())));
+                let _ = r.show();
+            });
+        }
         UiCommand::SearchSites(query) => {
             let result = d.search_sites(&query).await;
             let _ = add.upgrade_in_event_loop(move |a| {
@@ -312,6 +429,12 @@ async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>, add: &
             });
         }
     }
+}
+
+fn finding_label(r: &ReportWindow, f: &VerifyFinding) -> String {
+    let kind = r.global::<Fmt>().invoke_finding_kind(f.kind.as_str().into());
+    let detail = if f.kind == "error" && !f.detail.is_empty() { format!(" ({})", f.detail) } else { String::new() };
+    format!("{kind} — {}{detail}", f.path)
 }
 
 fn report(result: zbus::Result<()>, what: &str) {
@@ -392,7 +515,7 @@ impl Rates {
     }
 }
 
-fn to_row(d: &DriveStatus, rate: Option<f64>) -> DriveRow {
+fn to_row(d: &DriveStatus, rate: Option<f64>, v: Option<&VerifyStatus>) -> DriveRow {
     let int = |v: u64| i32::try_from(v).unwrap_or(i32::MAX);
     let gb = |v: u64| (v as f64 / 1e9) as f32;
     let p = &d.progress;
@@ -420,6 +543,13 @@ fn to_row(d: &DriveStatus, rate: Option<f64>) -> DriveRow {
         items: int(d.progress.items),
         downloaded: int(d.progress.downloaded),
         uploaded: int(d.progress.uploaded),
+        verify_state: v.map_or("", |v| v.state.as_str()).into(),
+        verify_done: v.map_or(0, |v| int(v.done)),
+        verify_total: v.map_or(0, |v| int(v.total)),
+        verify_fraction: v.filter(|v| v.total > 0).map_or(0.0, |v| (v.done as f64 / v.total as f64) as f32),
+        verify_problems: v.map_or(0, |v| int(v.problems())),
+        verify_mins: v.and_then(|v| minutes_since(&v.finished)).unwrap_or(-1),
+        verify_message: v.map_or("", |v| v.message.as_str()).into(),
     }
 }
 

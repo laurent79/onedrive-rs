@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use odrs_engine::{Stats, SyncMode};
 use odrs_graph::{AuthConfig, Graph};
-use odrs_ipc::{AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State};
+use odrs_ipc::{
+    AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State, VerifyFinding,
+};
 use odrs_store::Store;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::config::{self, Config, DriveConfig};
+use crate::verifier::Verifier;
 use crate::{Paths, Target};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
@@ -24,8 +27,8 @@ const OFFLINE_RETRY: Duration = Duration::from_secs(60);
 const DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// Drive list shared between the sync loop and D-Bus drive management.
-struct Drives {
-    targets: Vec<Target>,
+pub(crate) struct Drives {
+    pub(crate) targets: Vec<Target>,
     /// Drive ids removed since the last pass: their database rows are dropped.
     removed: Vec<String>,
     /// Bumped on every change, so the loop knows to rebuild its watchers.
@@ -47,13 +50,21 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         }
     };
     let drives = Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), version: 0 }));
-    let manager = Arc::new(Manager { graph: graph.clone(), config_path: paths.config(), cfg, drives: drives.clone() });
+    let verifier = Verifier::new(paths.db(), paths.config_dir.join("verify.json"), drives.clone());
+    let manager = Arc::new(Manager {
+        graph: graph.clone(),
+        config_path: paths.config(),
+        cfg,
+        drives: drives.clone(),
+        verifier: verifier.clone(),
+    });
     let (tx, mut rx) = mpsc::unbounded_channel();
     let info = Info { account, sync_dir: sync_dir.display().to_string() };
     let server = Server::start(info, tx, manager)
         .await
         .context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
     tracing::info!(interval = ?interval, ?mode, "daemon started");
+    let verifier_task = tokio::spawn(verifier.clone().run(server.clone()));
 
     let mut statuses: Vec<DriveStatus> = Vec::new();
     let mut watchers: Vec<odrs_watch::Watcher> = Vec::new();
@@ -187,6 +198,8 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         }
     }
     tracing::info!("daemon stopping");
+    verifier.shutdown();
+    let _ = verifier_task.await;
     Ok(())
 }
 
@@ -340,7 +353,7 @@ fn progress(s: &Stats) -> Progress {
     }
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     odrs_engine::convert::format_db_time(time::OffsetDateTime::from_unix_timestamp(secs).unwrap_or(time::OffsetDateTime::UNIX_EPOCH))
 }
@@ -353,6 +366,7 @@ struct Manager {
     /// Global options (filters, permissions...) applied to new drives.
     cfg: Config,
     drives: Arc<Mutex<Drives>>,
+    verifier: Verifier,
 }
 
 impl DriveManager for Manager {
@@ -418,8 +432,22 @@ impl DriveManager for Manager {
             drives.removed.push(id);
         }
         drives.version += 1;
+        drop(drives);
+        self.verifier.forget(&name);
         tracing::info!(drive = %name, "drive removed (local files kept)");
         Ok(())
+    }
+
+    fn verify(&self, name: String) -> std::result::Result<(), String> {
+        self.verifier.request(&name)
+    }
+
+    fn cancel_verify(&self, name: String) -> std::result::Result<(), String> {
+        self.verifier.cancel(&name)
+    }
+
+    fn verify_report(&self, name: String) -> std::result::Result<Vec<VerifyFinding>, String> {
+        self.verifier.report(&name)
     }
 }
 

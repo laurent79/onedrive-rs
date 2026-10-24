@@ -75,6 +75,48 @@ pub struct DriveStatus {
     pub progress: Progress,
 }
 
+/// Integrity check of one drive, in the `Verifications` property.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
+pub struct VerifyStatus {
+    /// Drive name, as in [`DriveStatus::name`].
+    pub name: String,
+    /// "queued" | "running" | "done" | "cancelled" | "failed"
+    pub state: String,
+    /// Files to check, checked so far, and bytes read.
+    pub total: u64,
+    pub done: u64,
+    pub bytes: u64,
+    pub identical: u64,
+    /// Other content but the recorded mtime: in sync (e.g. Office files enriched by SharePoint).
+    pub same_mtime: u64,
+    pub modified: u64,
+    pub missing: u64,
+    /// Unreadable files.
+    pub errors: u64,
+    /// RFC 3339 time it ended, empty while queued or running.
+    pub finished: String,
+    /// Why it failed.
+    pub message: String,
+}
+
+impl VerifyStatus {
+    /// Files that need attention.
+    pub fn problems(&self) -> u64 {
+        self.modified + self.missing + self.errors
+    }
+}
+
+/// A file that needs attention after a check, from `VerifyReport`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct VerifyFinding {
+    /// "modified" | "missing" | "error"
+    pub kind: String,
+    /// Absolute local path.
+    pub path: String,
+    /// Hashes for a modified file, the error for an unreadable one.
+    pub detail: String,
+}
+
 /// A SharePoint site, from `SearchSites`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct Site {
@@ -103,6 +145,12 @@ pub trait DriveManager: Send + Sync + 'static {
     fn add_drive(&self, name: String, drive_id: String, sync_dir: String) -> std::result::Result<(), String>;
     /// Stop syncing a `[drive]`; its local files are kept.
     fn remove_drive(&self, name: String) -> std::result::Result<(), String>;
+    /// Queue an integrity check of a drive (empty name: every drive).
+    fn verify(&self, name: String) -> std::result::Result<(), String>;
+    /// Stop the queued or running check of a drive (empty name: all).
+    fn cancel_verify(&self, name: String) -> std::result::Result<(), String>;
+    /// Files that need attention after the last check of a drive.
+    fn verify_report(&self, name: String) -> std::result::Result<Vec<VerifyFinding>, String>;
 }
 
 /// Commands sent by clients to the daemon loop.
@@ -127,6 +175,7 @@ struct Service {
     last_error: String,
     progress: Progress,
     drives: Vec<DriveStatus>,
+    verifications: Vec<VerifyStatus>,
     commands: mpsc::UnboundedSender<Command>,
     manager: Arc<dyn DriveManager>,
 }
@@ -169,6 +218,26 @@ impl Service {
     async fn remove_drive(&self, name: String) -> zbus::fdo::Result<()> {
         self.manager.remove_drive(name).map_err(zbus::fdo::Error::Failed)?;
         self.send(Command::SyncNow)
+    }
+
+    /// Check the local files of a drive against the database (empty name: every
+    /// drive), next to the sync passes. Read-only.
+    async fn verify(&self, name: String) -> zbus::fdo::Result<()> {
+        self.manager.verify(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn cancel_verify(&self, name: String) -> zbus::fdo::Result<()> {
+        self.manager.cancel_verify(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn verify_report(&self, name: String) -> zbus::fdo::Result<Vec<VerifyFinding>> {
+        self.manager.verify_report(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// Last or current integrity check of each drive that had one.
+    #[zbus(property)]
+    async fn verifications(&self) -> Vec<VerifyStatus> {
+        self.verifications.clone()
     }
 
     /// One entry per synchronised drive, `main` first.
@@ -228,6 +297,7 @@ impl Server {
             last_error: String::new(),
             progress: Progress::default(),
             drives: Vec::new(),
+            verifications: Vec::new(),
             commands,
             manager,
         };
@@ -271,6 +341,15 @@ impl Server {
         Ok(())
     }
 
+    pub async fn set_verifications(&self, verifications: Vec<VerifyStatus>) -> Result<()> {
+        let mut s = self.iface.get_mut().await;
+        if s.verifications != verifications {
+            s.verifications = verifications;
+            s.verifications_changed(self.emitter()).await?;
+        }
+        Ok(())
+    }
+
     /// Record the end of a pass: `Ok(time)` on success, `Err(message)` on failure.
     pub async fn finish_pass(&self, result: std::result::Result<String, String>) -> Result<()> {
         let mut s = self.iface.get_mut().await;
@@ -302,6 +381,11 @@ pub trait OneDrive {
     fn list_libraries(&self, site_id: &str) -> zbus::Result<Vec<Library>>;
     fn add_drive(&self, name: &str, drive_id: &str, sync_dir: &str) -> zbus::Result<()>;
     fn remove_drive(&self, name: &str) -> zbus::Result<()>;
+    fn verify(&self, name: &str) -> zbus::Result<()>;
+    fn cancel_verify(&self, name: &str) -> zbus::Result<()>;
+    fn verify_report(&self, name: &str) -> zbus::Result<Vec<VerifyFinding>>;
+    #[zbus(property)]
+    fn verifications(&self) -> zbus::Result<Vec<VerifyStatus>>;
     #[zbus(property)]
     fn drives(&self) -> zbus::Result<Vec<DriveStatus>>;
     #[zbus(property)]
@@ -328,6 +412,7 @@ pub struct Snapshot {
     pub sync_dir: String,
     pub progress: Progress,
     pub drives: Vec<DriveStatus>,
+    pub verifications: Vec<VerifyStatus>,
 }
 
 /// Session-bus client usable whether or not the daemon is running (it may
@@ -369,7 +454,9 @@ impl Client {
             (text("State"), text("LastSync"), text("LastError"), text("Account"), text("SyncDir"));
         let progress = all.remove("Progress").and_then(|v| Progress::try_from(v).ok()).unwrap_or_default();
         let drives = all.remove("Drives").and_then(|v| Vec::<DriveStatus>::try_from(v).ok()).unwrap_or_default();
-        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress, drives }))
+        let verifications =
+            all.remove("Verifications").and_then(|v| Vec::<VerifyStatus>::try_from(v).ok()).unwrap_or_default();
+        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress, drives, verifications }))
     }
 
     /// Method calls (`sync_now`, `pause`, `resume`, drive management).
