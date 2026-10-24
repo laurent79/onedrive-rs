@@ -43,6 +43,7 @@ enum UiCommand {
     CancelVerify(String),
     /// Fetch the findings of a drive's last check and show them.
     ShowReport(String),
+    Resync(String),
 }
 
 /// Run the UI on the current thread until the user quits from the tray menu.
@@ -55,6 +56,7 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     let tray = Tray::new()?;
     let add = AddLibraryWindow::new()?;
     let report = ReportWindow::new()?;
+    let resync = ResyncWindow::new()?;
     let initial = to_status(None);
     window.set_status(initial.clone());
     tray.set_status(initial);
@@ -93,6 +95,13 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
             let t = tx.clone();
             logic.on_show_report(move |name| {
                 let _ = t.send(UiCommand::ShowReport(name.into()));
+            });
+            let r = resync.as_weak();
+            logic.on_resync(move |name| {
+                let Some(r) = r.upgrade() else { return };
+                r.set_drive_title(drive_title(&name).into());
+                r.set_drive_name(name);
+                let _ = r.show();
             });
             let (a, t) = (add.as_weak(), tx.clone());
             logic.on_add_library(move || {
@@ -134,6 +143,18 @@ pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
     wire!(tray);
     wire_add_window(&add, &tx);
     wire_report_window(&report, &tx, &rt);
+    let (r, t) = (resync.as_weak(), tx.clone());
+    resync.on_confirm(move || {
+        let Some(r) = r.upgrade() else { return };
+        let _ = t.send(UiCommand::Resync(r.get_drive_name().into()));
+        let _ = r.hide();
+    });
+    let r = resync.as_weak();
+    resync.on_cancel(move || {
+        if let Some(r) = r.upgrade() {
+            let _ = r.hide();
+        }
+    });
 
     rt.spawn(poll(rx, window.as_weak(), tray.as_weak(), add.as_weak(), report.as_weak()));
 
@@ -362,9 +383,10 @@ async fn handle(
         UiCommand::Refresh => {}
         UiCommand::RemoveDrive(name) => report(d.remove_drive(&name).await, "remove drive"),
         UiCommand::Verify(name) => report(d.verify(&name).await, "verify"),
+        UiCommand::Resync(name) => report(d.resync(&name).await, "resync"),
         UiCommand::CancelVerify(name) => report(d.cancel_verify(&name).await, "cancel verify"),
         UiCommand::ShowReport(name) => {
-            let title = if name == "main" { "OneDrive".to_owned() } else { name.clone() };
+            let title = drive_title(&name);
             let findings = match d.verify_report(&name).await {
                 Ok(f) => f,
                 Err(e) => {
@@ -533,7 +555,7 @@ fn to_row(d: &DriveStatus, rate: Option<f64>, v: Option<&VerifyStatus>) -> Drive
         total_gb: gb(p.drive_bytes),
         rate_mbs: rate.map_or(-1.0, |r| (r / 1e6) as f32),
         eta_mins: eta,
-        title: if d.name == "main" { "OneDrive".into() } else { d.name.as_str().into() },
+        title: drive_title(&d.name).into(),
         removable: d.name != "main",
         name: d.name.as_str().into(),
         sync_dir: d.sync_dir.as_str().into(),
@@ -551,6 +573,11 @@ fn to_row(d: &DriveStatus, rate: Option<f64>, v: Option<&VerifyStatus>) -> Drive
         verify_mins: v.and_then(|v| minutes_since(&v.finished)).unwrap_or(-1),
         verify_message: v.map_or("", |v| v.message.as_str()).into(),
     }
+}
+
+/// Shown to the user: the account's own drive is "OneDrive".
+fn drive_title(name: &str) -> String {
+    if name == "main" { "OneDrive".to_owned() } else { name.to_owned() }
 }
 
 fn to_status(s: Option<&Snapshot>) -> Status {

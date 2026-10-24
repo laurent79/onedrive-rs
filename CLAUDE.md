@@ -59,6 +59,11 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
 - Permissions : dossiers 0700, fichiers 0600 (défauts D).
 - Daemon : intervalle 300 s ; inotify (bidirectionnel) → passe 5 s après le dernier changement ; hors ligne →
   nouvelle passe après 60 s ; login expiré → `LastError` préfixé `AUTH_ERROR_PREFIX` (bouton GUI).
+- Resync d'un drive (`--resync` de D ; CLI `resync --drive`, D-Bus `Resync`, icône GUI avec confirmation) :
+  `Store::delete_drive` efface ses lignes et son deltaLink entre deux passes, puis passe immédiate ; le moteur
+  rattache les fichiers locaux identiques (hash) sans les retélécharger, les différents → safeBackup puis
+  téléchargement. Sans référence, les suppressions d'un seul côté réapparaissent (comme D). La CLI ne passe
+  par D-Bus que si le verrou de *son* dossier de config est pris (le bus peut montrer le daemon d'une autre config).
 - Vérification d'intégrité (`odrs_engine::verify`, CLI `verify` et D-Bus `Verify`/`CancelVerify`/`VerifyReport`,
   propriété `Verifications`) : lecture seule, un drive à la fois à côté des passes (2 threads, connexion SQLite
   propre) ; écarts revérifiés à la fin (ligne DB changée = la synchro est passée par là → ignoré). Dernier
@@ -104,6 +109,10 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - `cargo test` ; scénarios d'upload sans réseau : `crates/engine/tests/upload_dry_run.rs` (mode dry-run).
 - `cargo run -p odrs-ipc --example mock_daemon` : faux daemon (drives, sites) pour travailler la GUI.
+- Rendu d'une fenêtre sans capturer le bureau : `kwin_wayland --virtual --socket odrs-snap --exit-with-session
+  "target/debug/examples/snapshot <main|resync|report> /tmp/w.rgba"` (`LANG=fr_FR.UTF-8` pour le français), puis
+  `magick -size <LxH affiché> -depth 8 rgba:/tmp/w.rgba w.png`. Le texte replié est mesuré sur une ligne par
+  Slint : donner un `min-height` aux fenêtres de texte.
 - `cargo run -p odrs-graph --example download -- <refresh_token> <drive> <item> <dest>` : test de reprise.
 - `onedrive-rs verify [--drive NAME] [--limit N]` : recalcule les QuickXorHash de chaque drive contre son dossier
   (lecture seule, daemon actif possible ; code de sortie 1 si fichier modifié/absent/illisible). Fichier au
@@ -116,7 +125,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : resync d'un drive, notifications bureau, changements en ligne quasi
+- À faire : notifications bureau, changements en ligne quasi
   instantanés (webhooks/WebSocket), sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
   uploads en session après redémarrage, progression des envois, application Entra dédiée, paquet RPM.
 

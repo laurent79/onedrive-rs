@@ -60,6 +60,8 @@ export global Logic {
     callback verify(string);
     callback cancel-verify(string);
     callback show-report(string);
+    // Ask for confirmation, then rebuild the drive's database (drive name).
+    callback resync(string);
     callback add-library();
     callback start-daemon();
     callback reconnect();
@@ -227,6 +229,11 @@ component DriveView inherits Rectangle {
                     tooltip: @tr("Check that the local files are intact");
                     enabled: drive.state != "pending";
                     clicked => { Logic.verify(drive.name); }
+                }
+                IconButton {
+                    icon: @image-url("../icons/resync.svg");
+                    tooltip: @tr("Resynchronise: rebuild the state of this drive from OneDrive");
+                    clicked => { Logic.resync(drive.name); }
                 }
                 if drive.removable: IconButton {
                     icon: root.confirm ? @image-url("../icons/disconnect-confirm.svg") : @image-url("../icons/disconnect.svg");
@@ -467,6 +474,57 @@ export component ReportWindow inherits Window {
                 text: @tr("Close");
                 primary: true;
                 clicked => { root.dismiss(); }
+            }
+        }
+    }
+}
+
+// Confirmation before a resync, which cannot be undone.
+export component ResyncWindow inherits Window {
+    in property <string> drive-name;
+    in property <string> drive-title;
+    callback confirm();
+    callback cancel();
+
+    title: @tr("Resynchronise {}", root.drive-title);
+    icon: @image-url("../icons/app.png");
+    preferred-width: 520px;
+    min-width: 400px;
+    // Wrapped text is measured on one line: without this the buttons end up below the window.
+    min-height: 360px;
+
+    VerticalBox {
+        Text {
+            text: @tr("Resynchronise “{}”?", root.drive-title);
+            font-size: 16px;
+            font-weight: 600;
+            wrap: word-wrap;
+        }
+        Text {
+            text: @tr("What onedrive-rs knows about this drive is forgotten and rebuilt from OneDrive, as after a first synchronisation:");
+            wrap: word-wrap;
+        }
+        Text {
+            text: @tr("• local files identical to the online ones are kept and not downloaded again;\n• differing local files are kept as “-safeBackup-” copies, then the online version is downloaded;\n• files deleted on one side only since the last sync come back;\n• local files that are not online are uploaded.");
+            wrap: word-wrap;
+        }
+        Text {
+            text: @tr("Every local file is read again, which takes a while for a large library. Use it when the drive looks out of sync.");
+            wrap: word-wrap;
+            color: Palette.foreground.transparentize(30%);
+        }
+        Rectangle { vertical-stretch: 1; }
+        HorizontalBox {
+            padding: 0;
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.cancel(); }
+            }
+            Button {
+                text: @tr("Resynchronise");
+                primary: true;
+                clicked => { root.confirm(); }
             }
         }
     }

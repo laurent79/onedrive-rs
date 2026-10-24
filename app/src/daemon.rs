@@ -31,6 +31,8 @@ pub(crate) struct Drives {
     pub(crate) targets: Vec<Target>,
     /// Drive ids removed since the last pass: their database rows are dropped.
     removed: Vec<String>,
+    /// Drives to resync before the next pass (names).
+    resync: Vec<String>,
     /// Bumped on every change, so the loop knows to rebuild its watchers.
     version: u64,
 }
@@ -49,7 +51,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             String::new()
         }
     };
-    let drives = Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), version: 0 }));
+    let drives = Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), resync: Vec::new(), version: 0 }));
     let verifier = Verifier::new(paths.db(), paths.config_dir.join("verify.json"), drives.clone());
     let manager = Arc::new(Manager {
         graph: graph.clone(),
@@ -77,15 +79,23 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
     let mut next = Instant::now();
     loop {
         // Apply drive list changes (startup, AddDrive, RemoveDrive).
-        let (targets, version, removed) = {
+        let (targets, version, removed, resync) = {
             let mut d = drives.lock().unwrap();
-            (d.targets.clone(), d.version, std::mem::take(&mut d.removed))
+            (d.targets.clone(), d.version, std::mem::take(&mut d.removed), std::mem::take(&mut d.resync))
         };
         for drive_id in removed {
             if let Some(root) = store.root(&drive_id)? {
                 store.delete(&root.drive_id, &root.id)?;
                 tracing::info!(drive_id, "drive removed from the database (local files kept)");
             }
+        }
+        for name in resync {
+            reset_drive(&store, &targets, &name);
+            // Shown as waiting for its first pass, like a new drive.
+            if let (Some(s), Some(t)) = (statuses.iter_mut().find(|s| s.name == name), targets.iter().find(|t| t.name == name)) {
+                *s = status_for(t, &[]);
+            }
+            server.set_drives(statuses.clone()).await?;
         }
         if watched_version != Some(version) {
             for t in &targets {
@@ -201,6 +211,21 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
     verifier.shutdown();
     let _ = verifier_task.await;
     Ok(())
+}
+
+/// Resync: drop the database rows of a drive (sync cursor included); the next
+/// pass enumerates it again and matches the local files.
+pub(crate) fn reset_drive(store: &Store, targets: &[Target], name: &str) {
+    let Some(t) = targets.iter().find(|t| t.name == name) else { return };
+    let libraries: Vec<String> = targets.iter().filter_map(|t| t.opts.drive_id.clone()).collect();
+    match crate::verify::drive_id_of(store, t, &libraries) {
+        Ok(Some(id)) => match store.delete_drive(&id) {
+            Ok(n) => tracing::info!(drive = name, rows = n, "resync: database rows dropped, the next pass rebuilds them"),
+            Err(e) => tracing::error!(drive = name, error = %e, "resync failed"),
+        },
+        Ok(None) => tracing::info!(drive = name, "resync: nothing recorded yet"),
+        Err(e) => tracing::error!(drive = name, error = %e, "resync failed"),
+    }
 }
 
 /// Keep what is known about a drive across drive list changes.
@@ -435,6 +460,22 @@ impl DriveManager for Manager {
         drop(drives);
         self.verifier.forget(&name);
         tracing::info!(drive = %name, "drive removed (local files kept)");
+        Ok(())
+    }
+
+    fn resync(&self, name: String) -> std::result::Result<(), String> {
+        let mut drives = self.drives.lock().unwrap();
+        let Some(t) = drives.targets.iter().find(|t| t.name.eq_ignore_ascii_case(&name)) else {
+            return Err(format!("no drive named \"{name}\""));
+        };
+        let name = t.name.clone();
+        if !drives.resync.contains(&name) {
+            drives.resync.push(name.clone());
+        }
+        drop(drives);
+        // Its last check describes a database that is about to go.
+        self.verifier.forget(&name);
+        tracing::info!(drive = %name, "resync requested");
         Ok(())
     }
 

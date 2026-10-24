@@ -72,6 +72,17 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Rebuild the database of drives from their online state (D's --resync).
+    /// Local files are kept: identical ones are only recorded, differing ones
+    /// are kept as safeBackup before the online version is downloaded.
+    Resync {
+        /// `main` or a [drive "name"] from the config. Repeatable.
+        #[arg(long = "drive", value_name = "NAME", required = true)]
+        drives: Vec<String>,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Run as a background service: periodic sync passes, controlled over D-Bus.
     Daemon {
         #[command(flatten)]
@@ -298,6 +309,7 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             let libraries: Vec<String> = cfg.drives.iter().map(|d| d.drive_id.clone()).collect();
             verify::run(&store, &verify::trees(&store, &targets, &libraries)?, limit, threads)
         }
+        Command::Resync { drives, yes } => resync(&paths, &cfg, drives, yes).await,
         Command::Daemon { args, interval } => {
             let (targets, mode) = args.resolve(&cfg)?;
             let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
@@ -318,6 +330,50 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
         }
         Command::Gui { .. } => unreachable!("handled in main"),
     }
+}
+
+async fn resync(paths: &Paths, cfg: &config::Config, drives: Vec<String>, yes: bool) -> Result<()> {
+    let (targets, _) = SyncArgs { mode: None, sync_dir: None, transfers: None, drives }.resolve(cfg)?;
+    let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+    if !yes {
+        eprintln!(
+            "Resync forgets what onedrive-rs knows about {} and rebuilds it from OneDrive:\n\
+             - local files identical to the online ones are kept as they are;\n\
+             - differing local files are kept as <name>-<host>-safeBackup-NNNN, then the online version is downloaded;\n\
+             - files deleted on one side only since the last sync come back (they cannot be told apart from new ones);\n\
+             - local files that are not online are uploaded.\n\
+             Type 'yes' to continue:",
+            names.join(", ")
+        );
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != "yes" {
+            bail!("resync not confirmed");
+        }
+    }
+    // Free lock: no daemon uses this config dir, do it here. Otherwise ask the
+    // daemon (the session bus may also show a daemon of another config dir).
+    let _lock = match lock(paths) {
+        Ok(l) => l,
+        Err(busy) => {
+            let client = odrs_ipc::Client::new().await.map_err(|_| busy)?;
+            if !client.is_running().await? {
+                bail!("{} is locked, but no daemon answers on the session bus", paths.config_dir.display());
+            }
+            for name in &names {
+                client.daemon().resync(name).await?;
+            }
+            eprintln!("Resync requested; the daemon rebuilds {} now.", names.join(", "));
+            return Ok(());
+        }
+    };
+    let store = Store::open(&paths.db())?;
+    let all = SyncArgs { mode: None, sync_dir: None, transfers: None, drives: Vec::new() }.resolve(cfg)?.0;
+    for name in &names {
+        daemon::reset_drive(&store, &all, name);
+    }
+    eprintln!("Done; the next `onedrive-rs sync` (or the daemon) rebuilds {}.", names.join(", "));
+    Ok(())
 }
 
 async fn login(paths: &Paths, auth: AuthConfig, manual: bool) -> Result<()> {

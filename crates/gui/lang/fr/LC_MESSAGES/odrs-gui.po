@@ -223,3 +223,24 @@ msgstr "Ne plus synchroniser cette bibliothèque"
 
 msgid "Click again to stop syncing this library (local files are kept)"
 msgstr "Cliquer à nouveau pour ne plus synchroniser cette bibliothèque (les fichiers locaux sont conservés)"
+
+msgid "Resynchronise: rebuild the state of this drive from OneDrive"
+msgstr "Resynchroniser : reconstruire l'état de ce dossier à partir de OneDrive"
+
+msgid "Resynchronise {}"
+msgstr "Resynchroniser {}"
+
+msgid "Resynchronise “{}”?"
+msgstr "Resynchroniser « {} » ?"
+
+msgid "What onedrive-rs knows about this drive is forgotten and rebuilt from OneDrive, as after a first synchronisation:"
+msgstr "Ce que onedrive-rs sait de ce dossier est oublié puis reconstruit à partir de OneDrive, comme lors d'une première synchronisation :"
+
+msgid "• local files identical to the online ones are kept and not downloaded again;\n• differing local files are kept as “-safeBackup-” copies, then the online version is downloaded;\n• files deleted on one side only since the last sync come back;\n• local files that are not online are uploaded."
+msgstr "• les fichiers locaux identiques à ceux en ligne sont conservés, sans nouveau téléchargement ;\n• les fichiers locaux différents sont conservés en copie « -safeBackup- », puis la version en ligne est téléchargée ;\n• les fichiers supprimés d'un seul côté depuis la dernière synchronisation réapparaissent ;\n• les fichiers locaux absents en ligne sont envoyés."
+
+msgid "Every local file is read again, which takes a while for a large library. Use it when the drive looks out of sync."
+msgstr "Chaque fichier local est relu, ce qui prend du temps pour une grande bibliothèque. À utiliser quand le dossier semble désynchronisé."
+
+msgid "Resynchronise"
+msgstr "Resynchroniser"

@@ -300,6 +300,15 @@ impl Store {
         Ok(())
     }
 
+    /// Forget everything known about a drive, sync cursor included (resync:
+    /// the next pass enumerates it again). Returns the number of rows removed.
+    pub fn delete_drive(&self, drive_id: &str) -> Result<u64> {
+        // Counted first: SQLite does not count the rows removed by ON DELETE CASCADE.
+        let n: i64 = self.conn.query_row("SELECT count(*) FROM item WHERE driveId = ?1", params![drive_id], |r| r.get(0))?;
+        self.conn.execute("DELETE FROM item WHERE driveId = ?1", params![drive_id])?;
+        Ok(n as u64)
+    }
+
     /// Number of items below `id` (not counting `id` itself).
     pub fn count_descendants(&self, drive_id: &str, id: &str) -> Result<u64> {
         let mut stmt = self.conn.prepare_cached(
@@ -450,7 +459,9 @@ mod tests {
         };
         assert_eq!((count(None), count(Some("D")), count(Some("E"))), (2, 1, 1));
         assert_eq!(s.roots().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["R"]);
-        s.delete("E", "G").unwrap();
+        assert_eq!(s.delete_drive("E").unwrap(), 1);
+        assert_eq!(s.delete_drive("E").unwrap(), 0);
+        assert_eq!(count(Some("D")), 1);
 
         assert_eq!(s.count_descendants("D", "R").unwrap(), 2);
         assert_eq!(s.count_descendants("D", "F").unwrap(), 0);

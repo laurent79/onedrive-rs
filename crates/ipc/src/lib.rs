@@ -145,6 +145,9 @@ pub trait DriveManager: Send + Sync + 'static {
     fn add_drive(&self, name: String, drive_id: String, sync_dir: String) -> std::result::Result<(), String>;
     /// Stop syncing a `[drive]`; its local files are kept.
     fn remove_drive(&self, name: String) -> std::result::Result<(), String>;
+    /// Forget what the database knows about a drive, so that the next pass
+    /// rebuilds it from the online state (D's `--resync`).
+    fn resync(&self, name: String) -> std::result::Result<(), String>;
     /// Queue an integrity check of a drive (empty name: every drive).
     fn verify(&self, name: String) -> std::result::Result<(), String>;
     /// Stop the queued or running check of a drive (empty name: all).
@@ -217,6 +220,14 @@ impl Service {
 
     async fn remove_drive(&self, name: String) -> zbus::fdo::Result<()> {
         self.manager.remove_drive(name).map_err(zbus::fdo::Error::Failed)?;
+        self.send(Command::SyncNow)
+    }
+
+    /// Rebuild a drive's database from the online state, keeping local files:
+    /// identical ones are only recorded, differing ones are kept as safeBackup
+    /// before the online version is downloaded. Runs before the next pass, which starts now.
+    async fn resync(&self, name: String) -> zbus::fdo::Result<()> {
+        self.manager.resync(name).map_err(zbus::fdo::Error::Failed)?;
         self.send(Command::SyncNow)
     }
 
@@ -381,6 +392,7 @@ pub trait OneDrive {
     fn list_libraries(&self, site_id: &str) -> zbus::Result<Vec<Library>>;
     fn add_drive(&self, name: &str, drive_id: &str, sync_dir: &str) -> zbus::Result<()>;
     fn remove_drive(&self, name: &str) -> zbus::Result<()>;
+    fn resync(&self, name: &str) -> zbus::Result<()>;
     fn verify(&self, name: &str) -> zbus::Result<()>;
     fn cancel_verify(&self, name: &str) -> zbus::Result<()>;
     fn verify_report(&self, name: &str) -> zbus::Result<Vec<VerifyFinding>>;

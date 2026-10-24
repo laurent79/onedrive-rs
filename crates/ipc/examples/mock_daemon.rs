@@ -155,6 +155,14 @@ impl DriveManager for Mock {
         Ok(())
     }
 
+    fn resync(&self, name: String) -> Result<(), String> {
+        if !self.names().contains(&name) {
+            return Err(format!("no drive named \"{name}\""));
+        }
+        self.verifications.lock().unwrap().retain(|s| s.name != name);
+        Ok(())
+    }
+
     fn verify(&self, name: String) -> Result<(), String> {
         let names = if name.is_empty() { self.names() } else { vec![name] };
         let mut v = self.verifications.lock().unwrap();
