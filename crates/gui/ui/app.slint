@@ -137,6 +137,16 @@ export global Fmt {
     }
 }
 
+// Square button showing only an icon, explained by a tooltip.
+component IconButton inherits Button {
+    in property <string> tooltip;
+    // Monochrome icons follow the text colour (light and dark themes).
+    in property <bool> colorize: true;
+    colorize-icon: root.colorize;
+    accessible-label: root.tooltip;
+    Tooltip { text: @markdown("\{root.tooltip}"); }
+}
+
 component DriveView inherits Rectangle {
     in property <DriveRow> drive;
     // Removal needs a second click.
@@ -197,29 +207,37 @@ component DriveView inherits Rectangle {
                 }
             }
         }
+        // Icons on the title line, so the card is no taller than its text.
         VerticalLayout {
-            alignment: center;
-            spacing: 4px;
-            Button {
-                text: @tr("Open");
-                clicked => { Logic.open-folder(drive.sync-dir); }
-            }
-            if drive.verify-state == "queued" || drive.verify-state == "running": Button {
-                text: @tr("Stop check");
-                clicked => { Logic.cancel-verify(drive.name); }
-            }
-            if drive.verify-state != "queued" && drive.verify-state != "running": Button {
-                text: @tr("Check");
-                enabled: drive.state != "pending";
-                clicked => { Logic.verify(drive.name); }
-            }
-            if drive.removable: Button {
-                text: root.confirm ? @tr("Confirm removal") : @tr("Remove");
-                clicked => {
-                    if root.confirm {
-                        Logic.remove-drive(drive.name);
-                    } else {
-                        root.confirm = true;
+            alignment: start;
+            HorizontalLayout {
+                spacing: 4px;
+                IconButton {
+                    icon: @image-url("../icons/folder-open.svg");
+                    tooltip: @tr("Open the folder");
+                    clicked => { Logic.open-folder(drive.sync-dir); }
+                }
+                if drive.verify-state == "queued" || drive.verify-state == "running": IconButton {
+                    icon: @image-url("../icons/stop.svg");
+                    tooltip: @tr("Stop the integrity check");
+                    clicked => { Logic.cancel-verify(drive.name); }
+                }
+                if drive.verify-state != "queued" && drive.verify-state != "running": IconButton {
+                    icon: @image-url("../icons/verify.svg");
+                    tooltip: @tr("Check that the local files are intact");
+                    enabled: drive.state != "pending";
+                    clicked => { Logic.verify(drive.name); }
+                }
+                if drive.removable: IconButton {
+                    icon: root.confirm ? @image-url("../icons/disconnect-confirm.svg") : @image-url("../icons/disconnect.svg");
+                    colorize: !root.confirm;
+                    tooltip: root.confirm ? @tr("Click again to stop syncing this library (local files are kept)") : @tr("Stop syncing this library");
+                    clicked => {
+                        if root.confirm {
+                            Logic.remove-drive(drive.name);
+                        } else {
+                            root.confirm = true;
+                        }
                     }
                 }
             }

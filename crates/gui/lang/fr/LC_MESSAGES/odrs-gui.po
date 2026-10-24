@@ -209,17 +209,17 @@ msgstr "Absent"
 msgid "Unreadable"
 msgstr "Illisible"
 
-msgid "Open"
-msgstr "Ouvrir"
+msgid "Open the folder"
+msgstr "Ouvrir le dossier"
 
-msgid "Remove"
-msgstr "Retirer"
-
-msgid "Confirm removal"
-msgstr "Confirmer le retrait"
-
-msgid "Stop check"
+msgid "Stop the integrity check"
 msgstr "Arrêter la vérification"
 
-msgid "Check"
-msgstr "Vérifier"
+msgid "Check that the local files are intact"
+msgstr "Vérifier que les fichiers locaux sont intacts"
+
+msgid "Stop syncing this library"
+msgstr "Ne plus synchroniser cette bibliothèque"
+
+msgid "Click again to stop syncing this library (local files are kept)"
+msgstr "Cliquer à nouveau pour ne plus synchroniser cette bibliothèque (les fichiers locaux sont conservés)"
