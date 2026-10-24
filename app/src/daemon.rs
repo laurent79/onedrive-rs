@@ -374,7 +374,7 @@ fn progress(s: &Stats) -> Progress {
         deleted_online: g(&s.deleted_online),
         errors: g(&s.errors),
         drive_bytes: g(&s.drive_bytes),
-        synced_bytes: (g(&s.synced_bytes_at_start) + g(&s.bytes)).min(g(&s.drive_bytes)),
+        synced_bytes: (g(&s.synced_bytes_at_start) + g(&s.recorded_bytes) + g(&s.bytes)).min(g(&s.drive_bytes)),
     }
 }
 

@@ -113,6 +113,9 @@ pub struct Stats {
     pub drive_bytes: AtomicU64,
     /// Size of the files already synced when the pass started.
     pub synced_bytes_at_start: AtomicU64,
+    /// Size of the files found identical locally and recorded without a
+    /// download (resync, takeover): synced too, for overall progress.
+    pub recorded_bytes: AtomicU64,
     pub unchanged: AtomicU64,
     pub dirs_created: AtomicU64,
     pub deleted: AtomicU64,

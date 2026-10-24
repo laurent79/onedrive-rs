@@ -242,6 +242,10 @@ impl<'a> DownloadSync<'a> {
                     local::set_mtime(&path, mtime)?;
                 }
                 self.stats.unchanged.fetch_add(1, Ordering::Relaxed);
+                if prev.is_none() {
+                    // Not counted in synced_bytes_at_start.
+                    self.stats.recorded_bytes.fetch_add(db.size.unwrap_or(0).max(0) as u64, Ordering::Relaxed);
+                }
                 Ok(self.store.upsert(&db)?)
             }
             FileAction::Download { backup } => {
