@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-util = { version = "0.3.34", default-features = false }
 odrs-ipc = { version = "0.1.0", path = "../ipc" }
 slint = { version = "1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2", "system-tray"] }
 thiserror = "2.0.21"

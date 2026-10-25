@@ -15,6 +15,11 @@ pub const BUS_NAME: &str = "io.github.onedrive_rs.OneDrive1";
 pub const OBJECT_PATH: &str = "/io/github/onedrive_rs/OneDrive1";
 /// `LastError` starts with this when the stored login is no longer valid.
 pub const AUTH_ERROR_PREFIX: &str = "[login required]";
+/// Error messages start with this when the network is down (retried shortly):
+/// clients show them but do not raise a notification.
+pub const OFFLINE_ERROR_PREFIX: &str = "[offline]";
+/// Events kept in the `Events` property.
+pub const MAX_EVENTS: usize = 100;
 
 pub use zbus::Error;
 pub type Result<T> = zbus::Result<T>;
@@ -117,6 +122,24 @@ pub struct VerifyFinding {
     pub detail: String,
 }
 
+/// Something that happened in the daemon, in the `Events` property, for
+/// notifications (and later an activity list).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
+pub struct Event {
+    /// Increasing; starts from the daemon's start time in milliseconds, so ids
+    /// keep increasing across restarts and clients can tell new events apart.
+    pub id: u64,
+    /// RFC 3339.
+    pub time: String,
+    /// "conflict" (path: the file, detail: its safeBackup copy) |
+    /// "initial-sync" (a drive enumerated as a whole was synced: first sync, resync)
+    pub kind: String,
+    /// Drive name, as in [`DriveStatus::name`].
+    pub drive: String,
+    pub path: String,
+    pub detail: String,
+}
+
 /// A SharePoint site, from `SearchSites`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct Site {
@@ -179,6 +202,7 @@ struct Service {
     progress: Progress,
     drives: Vec<DriveStatus>,
     verifications: Vec<VerifyStatus>,
+    events: Vec<Event>,
     commands: mpsc::UnboundedSender<Command>,
     manager: Arc<dyn DriveManager>,
 }
@@ -245,6 +269,12 @@ impl Service {
         self.manager.verify_report(name).map_err(zbus::fdo::Error::Failed)
     }
 
+    /// Recent events, oldest first (at most [`MAX_EVENTS`]).
+    #[zbus(property)]
+    async fn events(&self) -> Vec<Event> {
+        self.events.clone()
+    }
+
     /// Last or current integrity check of each drive that had one.
     #[zbus(property)]
     async fn verifications(&self) -> Vec<VerifyStatus> {
@@ -309,6 +339,7 @@ impl Server {
             progress: Progress::default(),
             drives: Vec::new(),
             verifications: Vec::new(),
+            events: Vec::new(),
             commands,
             manager,
         };
@@ -350,6 +381,18 @@ impl Server {
             s.drives_changed(self.emitter()).await?;
         }
         Ok(())
+    }
+
+    /// Publish events; their ids must already be set (see [`Event::id`]).
+    pub async fn push_events(&self, events: Vec<Event>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut s = self.iface.get_mut().await;
+        s.events.extend(events);
+        let excess = s.events.len().saturating_sub(MAX_EVENTS);
+        s.events.drain(..excess);
+        s.events_changed(self.emitter()).await
     }
 
     pub async fn set_verifications(&self, verifications: Vec<VerifyStatus>) -> Result<()> {
@@ -399,6 +442,8 @@ pub trait OneDrive {
     #[zbus(property)]
     fn verifications(&self) -> zbus::Result<Vec<VerifyStatus>>;
     #[zbus(property)]
+    fn events(&self) -> zbus::Result<Vec<Event>>;
+    #[zbus(property)]
     fn drives(&self) -> zbus::Result<Vec<DriveStatus>>;
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
@@ -425,6 +470,7 @@ pub struct Snapshot {
     pub progress: Progress,
     pub drives: Vec<DriveStatus>,
     pub verifications: Vec<VerifyStatus>,
+    pub events: Vec<Event>,
 }
 
 /// Session-bus client usable whether or not the daemon is running (it may
@@ -468,7 +514,8 @@ impl Client {
         let drives = all.remove("Drives").and_then(|v| Vec::<DriveStatus>::try_from(v).ok()).unwrap_or_default();
         let verifications =
             all.remove("Verifications").and_then(|v| Vec::<VerifyStatus>::try_from(v).ok()).unwrap_or_default();
-        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress, drives, verifications }))
+        let events = all.remove("Events").and_then(|v| Vec::<Event>::try_from(v).ok()).unwrap_or_default();
+        Ok(Some(Snapshot { state, last_sync, last_error, account, sync_dir, progress, drives, verifications, events }))
     }
 
     /// Method calls (`sync_now`, `pause`, `resume`, drive management).

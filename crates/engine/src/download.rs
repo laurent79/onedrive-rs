@@ -83,7 +83,10 @@ impl<'a> DownloadSync<'a> {
 
         let mut url = match self.store.delta_link(&root_drive, &root_item.id)? {
             Some(link) => link,
-            None => Graph::delta_initial_url(&root_drive, &root_item.id),
+            None => {
+                self.stats.full_enumeration.store(true, Ordering::Relaxed);
+                Graph::delta_initial_url(&root_drive, &root_item.id)
+            }
         };
         let delta_link = loop {
             let page = match self.graph.delta_page(&url).await {
@@ -91,6 +94,7 @@ impl<'a> DownloadSync<'a> {
                 Err(e) if e.status() == Some(410) => {
                     tracing::warn!("delta token expired (410 Gone), restarting a full enumeration");
                     self.store.set_delta_link(&root_drive, &root_item.id, None)?;
+                    self.stats.full_enumeration.store(true, Ordering::Relaxed);
                     url = Graph::delta_initial_url(&root_drive, &root_item.id);
                     continue;
                 }
@@ -259,10 +263,14 @@ impl<'a> DownloadSync<'a> {
                 self.in_flight.insert(db.id.clone());
                 self.tasks.spawn(async move {
                     let result = download(&graph, &db, &path, mtime, device.as_deref(), file_mode).await;
-                    if let Ok(bytes) = result {
+                    if let Ok((bytes, backup)) = &result {
                         stats.downloaded.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+                        stats.bytes.fetch_add(*bytes, Ordering::Relaxed);
+                        if let Some(b) = backup {
+                            stats.record_backup(&path, b.clone());
+                        }
                     }
+                    let result = result.map(|(bytes, _)| bytes);
                     Outcome { item: db, path, result }
                 });
                 Ok(())
@@ -303,6 +311,7 @@ impl<'a> DownloadSync<'a> {
                 } else {
                     let backup = local::safe_backup(&path, &self.opts.device_name)?;
                     tracing::warn!(path = %rel, backup = %backup.display(), "deleted online but modified locally; kept as safeBackup");
+                    self.stats.record_backup(&path, backup);
                 }
             }
             ItemType::Dir => {
@@ -383,7 +392,7 @@ pub(crate) async fn download(
     mtime: OffsetDateTime,
     backup_device: Option<&str>,
     file_mode: u32,
-) -> Result<u64, Error> {
+) -> Result<(u64, Option<PathBuf>), Error> {
     let partial = local::partial_path(path);
     let result = async {
         let (hash, size) = graph.download_to(&item.drive_id, &item.id, &partial).await?;
@@ -397,14 +406,16 @@ pub(crate) async fn download(
         }
         local::set_permissions(&partial, file_mode)?;
         local::set_mtime(&partial, mtime)?;
+        let mut backup = None;
         if let Some(device) = backup_device
             && matches!(local::stat(path)?, LocalState::File { .. })
         {
             let b = local::safe_backup(path, device)?;
             tracing::warn!(path = %path.display(), backup = %b.display(), "local file differs from online version; kept as safeBackup");
+            backup = Some(b);
         }
         std::fs::rename(&partial, path)?;
-        Ok(size)
+        Ok((size, backup))
     }
     .await;
     // Keep a partial download for resumption, unless its content is wrong.

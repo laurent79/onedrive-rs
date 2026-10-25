@@ -244,3 +244,35 @@ msgstr "Chaque fichier local est relu, ce qui prend du temps pour une grande bib
 
 msgid "Resynchronise"
 msgstr "Resynchroniser"
+
+msgid "OneDrive: sign-in required"
+msgstr "OneDrive : connexion requise"
+
+msgid "{}: synchronisation error"
+msgstr "{} : erreur de synchronisation"
+
+msgid "{}: file changed on both sides"
+msgstr "{} : fichier modifié des deux côtés"
+
+msgid "{} is synchronised"
+msgstr "{} est synchronisé"
+
+msgid "{}: integrity check complete"
+msgstr "{} : vérification terminée"
+
+msgid "The Microsoft session has expired: synchronisation is stopped until you sign in again."
+msgstr "La session Microsoft a expiré : la synchronisation est arrêtée jusqu'à la prochaine connexion."
+
+msgid "{}: your local version was kept as {}."
+msgstr "{} : votre version locale a été conservée sous le nom {}."
+
+msgid "{n} local version was kept as a “-safeBackup-” copy."
+msgid_plural "{n} local versions were kept as “-safeBackup-” copies."
+msgstr[0] "{n} version locale a été conservée en copie « -safeBackup- »."
+msgstr[1] "{n} versions locales ont été conservées en copies « -safeBackup- »."
+
+msgid "The first synchronisation is complete."
+msgstr "La première synchronisation est terminée."
+
+msgid "All files are intact."
+msgstr "Tous les fichiers sont intacts."

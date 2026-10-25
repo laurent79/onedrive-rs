@@ -10,9 +10,9 @@ pub mod moves;
 mod upload;
 pub mod verify;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use odrs_graph::Graph;
 use odrs_store::Store;
@@ -128,8 +128,28 @@ pub struct Stats {
     pub moved_online: AtomicU64,
     /// Uploads postponed because the file was modified a moment ago.
     pub deferred: AtomicU64,
-    /// Files changed both locally and online, kept as safeBackup.
+    /// Local versions kept as safeBackup (changed on both sides, or deleted
+    /// online but modified locally).
     pub conflicts: AtomicU64,
+    /// The safeBackup copies made during the pass, in order.
+    pub backups: Mutex<Vec<Backup>>,
+    /// The pass started without a sync cursor and enumerated the whole drive
+    /// (first sync, resync, expired cursor).
+    pub full_enumeration: AtomicBool,
+}
+
+/// A local version moved aside before it was replaced or deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backup {
+    pub path: PathBuf,
+    pub backup: PathBuf,
+}
+
+impl Stats {
+    pub(crate) fn record_backup(&self, path: &Path, backup: PathBuf) {
+        self.conflicts.fetch_add(1, Ordering::Relaxed);
+        self.backups.lock().unwrap().push(Backup { path: path.to_owned(), backup });
+    }
 }
 
 pub(crate) async fn resolve_drive(graph: &Graph, opts: &SyncOptions) -> Result<odrs_graph::Drive, Error> {

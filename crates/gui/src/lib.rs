@@ -6,9 +6,14 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt as _;
 use odrs_ipc::{Client, DriveStatus, Snapshot, VerifyFinding, VerifyStatus};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
 use tokio::sync::mpsc;
+
+use crate::notify::{Action, Change, Note, Notifier, Watcher};
+
+mod notify;
 
 slint::include_modules!();
 
@@ -325,12 +330,50 @@ async fn poll(
     let mut last: Option<Snapshot> = None;
     let mut rates = Rates::default();
     let mut tick = tokio::time::interval(REFRESH);
+    let mut watcher = Watcher::default();
+    // Notes are translated on the UI thread, then come back here to be sent.
+    let (notes_tx, mut notes_rx) = mpsc::unbounded_channel::<Vec<Note>>();
+    let mut notifier = match Notifier::new().await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(error = %e, "desktop notifications unavailable");
+            None
+        }
+    };
+    let mut clicks = match &notifier {
+        Some(n) => n.clicks().await.ok(),
+        None => None,
+    };
     loop {
         tokio::select! {
             _ = tick.tick() => {}
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return };
                 handle(&client, cmd, last.as_ref(), &add, &report).await;
+            }
+            Some(notes) = notes_rx.recv() => {
+                if let Some(n) = notifier.as_mut() {
+                    for note in notes {
+                        n.send(note).await;
+                    }
+                }
+                continue;
+            }
+            Some(click) = next_click(&mut clicks) => {
+                let action = click.args().ok().and_then(|a| notifier.as_mut()?.action(a.id, &a.action_key));
+                match action {
+                    Some(Action::ShowWindow) => {
+                        let _ = window.upgrade_in_event_loop(|w| w.global::<Logic>().invoke_show_window());
+                    }
+                    Some(Action::Reconnect) => {
+                        let _ = window.upgrade_in_event_loop(|w| w.global::<Logic>().invoke_reconnect());
+                    }
+                    Some(Action::ShowReport(drive)) => handle(&client, UiCommand::ShowReport(drive), last.as_ref(), &add, &report).await,
+                    Some(Action::ShowItem(path)) => show_in_folder(path).await,
+                    Some(Action::OpenFolder(path)) => open_folder(&path),
+                    None => {}
+                }
+                continue;
             }
         }
         let snapshot = match client.snapshot().await {
@@ -350,6 +393,14 @@ async fn poll(
                     .collect()
             })
             .unwrap_or_default();
+        let changes = watcher.changes(snapshot.as_ref());
+        if !changes.is_empty() {
+            let notes_tx = notes_tx.clone();
+            let _ = window.upgrade_in_event_loop(move |w| {
+                let fmt = w.global::<Fmt>();
+                let _ = notes_tx.send(changes.iter().map(|c| to_note(&fmt, c)).collect());
+            });
+        }
         last = snapshot;
         let s = status.clone();
         let _ = window.upgrade_in_event_loop(move |w| {
@@ -365,6 +416,59 @@ async fn poll(
                 t.set_status(status);
             }
         });
+    }
+}
+
+async fn next_click(clicks: &mut Option<notify::ActionInvokedStream>) -> Option<notify::ActionInvoked> {
+    match clicks {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Texts of a notification, translated through the Slint catalogue.
+fn to_note(fmt: &Fmt<'_>, change: &Change) -> Note {
+    let title = |kind: &str, drive: &str| fmt.invoke_note_title(kind.into(), drive_title(drive).into()).to_string();
+    let body = |kind: &str, a: &str, b: &str, n: u64| {
+        fmt.invoke_note_body(kind.into(), a.into(), b.into(), i32::try_from(n).unwrap_or(i32::MAX)).to_string()
+    };
+    let button = |kind: &str, action: Action| {
+        let label = fmt.invoke_note_button(kind.into());
+        (!label.is_empty()).then(|| (label.to_string(), action))
+    };
+    let file_name = |p: &str| std::path::Path::new(p).file_name().map_or(p.to_owned(), |n| n.to_string_lossy().into_owned());
+    let note = |kind: &str, drive: &str, body: String, button: Option<(String, Action)>| Note {
+        title: title(kind, drive),
+        body,
+        button,
+        urgent: kind == "login",
+    };
+    match change {
+        Change::LoginExpired => note("login", "", body("login", "", "", 0), button("login", Action::Reconnect)),
+        Change::DriveError { drive, message } => {
+            let message = message.trim_start_matches(odrs_ipc::AUTH_ERROR_PREFIX).trim();
+            note("error", drive, body("error", message, "", 0), None)
+        }
+        Change::Conflict { drive, path, backup } => note(
+            "conflict",
+            drive,
+            body("conflict", &file_name(path), &file_name(backup), 0),
+            button("conflict", Action::ShowItem(backup.clone())),
+        ),
+        Change::Conflicts { drive, count } => note("conflicts", drive, body("conflicts", "", "", *count as u64), None),
+        Change::InitialSync { drive, sync_dir } => note(
+            "initial-sync",
+            drive,
+            body("initial-sync", "", "", 0),
+            (!sync_dir.is_empty()).then(|| button("initial-sync", Action::OpenFolder(sync_dir.clone()))).flatten(),
+        ),
+        Change::VerifyDone { drive, problems: 0 } => note("verify-ok", drive, body("verify-ok", "", "", 0), None),
+        Change::VerifyDone { drive, problems } => note(
+            "verify-problems",
+            drive,
+            body("verify-problems", "", "", *problems),
+            button("verify-problems", Action::ShowReport(drive.clone())),
+        ),
     }
 }
 

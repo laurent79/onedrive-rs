@@ -79,6 +79,35 @@ component StateIcon inherits Image {
 }
 
 export global Fmt {
+    // Desktop notifications, `kind` as in notify.rs: title, body and button label.
+    public pure function note-title(kind: string, drive: string) -> string {
+        if kind == "login" { return @tr("OneDrive: sign-in required"); }
+        if kind == "error" { return @tr("{}: synchronisation error", drive); }
+        if kind == "conflict" || kind == "conflicts" { return @tr("{}: file changed on both sides", drive); }
+        if kind == "initial-sync" { return @tr("{} is synchronised", drive); }
+        return @tr("{}: integrity check complete", drive);
+    }
+
+    public pure function note-body(kind: string, a: string, b: string, n: int) -> string {
+        if kind == "login" { return @tr("The Microsoft session has expired: synchronisation is stopped until you sign in again."); }
+        if kind == "error" { return a; }
+        if kind == "conflict" { return @tr("{}: your local version was kept as {}.", a, b); }
+        if kind == "conflicts" {
+            return @tr("{n} local version was kept as a “-safeBackup-” copy." | "{n} local versions were kept as “-safeBackup-” copies." % n);
+        }
+        if kind == "initial-sync" { return @tr("The first synchronisation is complete."); }
+        if kind == "verify-ok" { return @tr("All files are intact."); }
+        return @tr("{n} file needs attention" | "{n} files need attention" % n);
+    }
+
+    public pure function note-button(kind: string) -> string {
+        if kind == "login" { return @tr("Sign in again"); }
+        if kind == "conflict" { return @tr("Show in folder"); }
+        if kind == "initial-sync" { return @tr("Open the folder"); }
+        if kind == "verify-problems" { return @tr("Details…"); }
+        return "";
+    }
+
     // Kind of a verification finding, as listed in the report.
     public pure function finding-kind(kind: string) -> string {
         if kind == "modified" { return @tr("Modified"); }

@@ -5,7 +5,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use odrs_ipc::{BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State, VerifyFinding, VerifyStatus};
+use odrs_ipc::{
+    BoxFuture, Command, DriveManager, DriveStatus, Event, Info, Library, Progress, Server, Site, State, VerifyFinding, VerifyStatus,
+};
 use tokio::sync::mpsc;
 
 #[tokio::main(flavor = "current_thread")]
@@ -43,6 +45,22 @@ async fn main() -> odrs_ipc::Result<()> {
                 server.set_progress(progress).await?;
                 server.set_drives(manager.statuses(progress)).await?;
                 if progress.items >= 2000 {
+                    // A conflict and the end of a first sync, for notifications.
+                    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let event = |id, kind: &str, path: &str, detail: &str| Event {
+                        id,
+                        time: "2026-10-23T12:00:00Z".into(),
+                        kind: kind.into(),
+                        drive: "main".into(),
+                        path: path.into(),
+                        detail: detail.into(),
+                    };
+                    server
+                        .push_events(vec![
+                            event(id, "conflict", "/tmp/OneDrive/Documents/plan.xlsx", "/tmp/OneDrive/Documents/plan-pc-safeBackup-0001.xlsx"),
+                            event(id + 1, "initial-sync", "", ""),
+                        ])
+                        .await?;
                     server.finish_pass(Ok("2026-10-23T12:00:00Z".into())).await?;
                     server.set_state(State::Idle).await?;
                     paused = true; // idle until SyncNow

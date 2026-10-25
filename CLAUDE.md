@@ -64,6 +64,12 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   rattache les fichiers locaux identiques (hash) sans les retélécharger, les différents → safeBackup puis
   téléchargement. Sans référence, les suppressions d'un seul côté réapparaissent (comme D). La CLI ne passe
   par D-Bus que si le verrou de *son* dossier de config est pris (le bus peut montrer le daemon d'une autre config).
+- Notifications bureau (`org.freedesktop.Notifications`) envoyées par la GUI (`crates/gui/src/notify.rs`) : elle
+  compare deux instantanés du daemon (1er = référence, rien de passé n'est notifié). Login expiré, erreur d'un drive
+  (une fois par message, chiffres ignorés ; erreurs réseau préfixées `OFFLINE_ERROR_PREFIX` ignorées), conflits
+  (safeBackup, regroupés au-delà de 3), fin de synchro complète (`Stats::full_enumeration` : 1re synchro, resync,
+  410), fin de vérification. Conflits et synchro complète passent par la propriété D-Bus `Events` (ids croissants
+  même après redémarrage du daemon). Textes traduits via `Fmt.note-*` dans le Slint.
 - Vérification d'intégrité (`odrs_engine::verify`, CLI `verify` et D-Bus `Verify`/`CancelVerify`/`VerifyReport`,
   propriété `Verifications`) : lecture seule, un drive à la fois à côté des passes (2 threads, connexion SQLite
   propre) ; écarts revérifiés à la fin (ligne DB changée = la synchro est passée par là → ignoré). Dernier
@@ -125,7 +131,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : notifications bureau, changements en ligne quasi
+- À faire : changements en ligne quasi
   instantanés (webhooks/WebSocket), sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
   uploads en session après redémarrage, progression des envois, application Entra dédiée, paquet RPM.
 

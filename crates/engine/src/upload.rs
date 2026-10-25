@@ -33,7 +33,7 @@ enum Outcome {
     Uploaded(Item, u64),
     /// Changed both locally and online: the local version was kept as a
     /// safeBackup and the online version downloaded in its place.
-    Conflict(Item),
+    Conflict(Item, PathBuf, PathBuf),
 }
 
 /// A file modified less than this many seconds ago is not uploaded yet.
@@ -462,8 +462,8 @@ impl<'a> UploadSync<'a> {
                 self.stats.uploaded_bytes.fetch_add(size, Ordering::Relaxed);
                 Ok(self.store.upsert(&item)?)
             }
-            Ok(Outcome::Conflict(item)) => {
-                self.stats.conflicts.fetch_add(1, Ordering::Relaxed);
+            Ok(Outcome::Conflict(item, path, backup)) => {
+                self.stats.record_backup(&path, backup);
                 Ok(self.store.upsert(&item)?)
             }
             Err(e) if e.is_fatal() => Err(e),
@@ -524,7 +524,7 @@ async fn upload(
             let online = to_db_item(&graph.get_item(&drive_id, item_id).await?, &drive_id)?;
             let online_mtime = parse_graph_time(&online.mtime).ok_or(Error::InvalidItem(online.id.clone(), "bad mtime"))?;
             crate::download::download(graph, &online, path, online_mtime, None, file_mode).await?;
-            return Ok(Outcome::Conflict(online));
+            return Ok(Outcome::Conflict(online, path.to_owned(), backup));
         }
         Err(e) => return Err(e.into()),
     };

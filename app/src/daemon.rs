@@ -2,7 +2,7 @@
 //! controlled over D-Bus.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,8 @@ use anyhow::{Context as _, Result};
 use odrs_engine::{Stats, SyncMode};
 use odrs_graph::{AuthConfig, Graph};
 use odrs_ipc::{
-    AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Info, Library, Progress, Server, Site, State, VerifyFinding,
+    AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Event, Info, Library, OFFLINE_ERROR_PREFIX, Progress, Server,
+    Site, State, VerifyFinding,
 };
 use odrs_store::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -67,6 +68,10 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         .context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
     tracing::info!(interval = ?interval, ?mode, "daemon started");
     let verifier_task = tokio::spawn(verifier.clone().run(server.clone()));
+    // Event ids keep increasing across restarts (see odrs_ipc::Event::id).
+    let event_ids = AtomicU64::new(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+    );
 
     let mut statuses: Vec<DriveStatus> = Vec::new();
     let mut watchers: Vec<odrs_watch::Watcher> = Vec::new();
@@ -158,7 +163,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         let started = Instant::now();
         let mut sync_requested = false;
         let outcome = tokio::select! {
-            r = run_pass(&graph, &store, &targets, mode, &server, &shared) => Some(r),
+            r = run_pass(&graph, &store, &targets, mode, &server, &shared, &event_ids) => Some(r),
             () = until_pause(&mut rx, &mut sync_requested) => None,
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -189,6 +194,8 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             if outcome.failures.iter().any(|(_, e)| e.is_auth()) {
                 // Recognised by the GUI, which then offers to sign in again.
                 msg = format!("{AUTH_ERROR_PREFIX} {msg}");
+            } else if outcome.failures.iter().all(|(_, e)| e.is_network()) {
+                msg = format!("{OFFLINE_ERROR_PREFIX} {msg}");
             }
             server.finish_pass(Err(msg)).await?;
             server.set_state(State::Error).await?;
@@ -257,6 +264,7 @@ async fn run_pass(
     mode: SyncMode,
     server: &Server,
     statuses: &Arc<Mutex<Vec<DriveStatus>>>,
+    event_ids: &AtomicU64,
 ) -> PassOutcome {
     let mut out = PassOutcome { failures: Vec::new(), total: Progress::default(), deferred: 0 };
     for (i, t) in targets.iter().enumerate() {
@@ -300,15 +308,47 @@ async fn run_pass(
                 }
                 Err(e) => {
                     s.state = "error".into();
-                    s.last_error = if e.is_auth() { format!("{AUTH_ERROR_PREFIX} {e}") } else { e.to_string() };
+                    s.last_error = if e.is_auth() {
+                        format!("{AUTH_ERROR_PREFIX} {e}")
+                    } else if e.is_network() {
+                        format!("{OFFLINE_ERROR_PREFIX} {e}")
+                    } else {
+                        e.to_string()
+                    };
                 }
             }
         });
         publish(server, statuses).await;
+        let events = drive_events(&t.name, &stats, result.is_ok() && p.errors == 0, event_ids);
+        if let Err(e) = server.push_events(events).await {
+            tracing::debug!(error = %e, "cannot publish events");
+        }
         if let Err(e) = result {
             tracing::error!(drive = %t.name, error = %e, "sync pass failed");
             out.failures.push((t.name.clone(), e));
         }
+    }
+    out
+}
+
+/// What clients may want to notify about a drive's pass: each safeBackup made,
+/// and the end of a sync that enumerated the whole drive.
+fn drive_events(drive: &str, stats: &Stats, succeeded: bool, ids: &AtomicU64) -> Vec<Event> {
+    let time = now_rfc3339();
+    let event = |kind: &str, path: String, detail: String| Event {
+        id: ids.fetch_add(1, Ordering::Relaxed),
+        time: time.clone(),
+        kind: kind.into(),
+        drive: drive.into(),
+        path,
+        detail,
+    };
+    let mut out: Vec<Event> = std::mem::take(&mut *stats.backups.lock().unwrap())
+        .into_iter()
+        .map(|b| event("conflict", b.path.display().to_string(), b.backup.display().to_string()))
+        .collect();
+    if succeeded && stats.full_enumeration.load(Ordering::Relaxed) {
+        out.push(event("initial-sync", String::new(), String::new()));
     }
     out
 }
