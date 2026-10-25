@@ -7,6 +7,7 @@ mod download;
 pub mod filter;
 pub mod local;
 pub mod moves;
+mod sessions;
 mod upload;
 pub mod verify;
 
@@ -78,6 +79,8 @@ pub struct SyncOptions {
     pub file_mode: u32,
     /// Drive to sync (e.g. a SharePoint document library); `None` = the account's own OneDrive.
     pub drive_id: Option<String>,
+    /// Where interrupted upload sessions are kept to be resumed; `None`: not resumable.
+    pub upload_sessions: Option<PathBuf>,
 }
 
 impl SyncOptions {
@@ -92,6 +95,7 @@ impl SyncOptions {
             dir_mode: 0o700,
             file_mode: 0o600,
             drive_id: None,
+            upload_sessions: None,
         }
     }
 }

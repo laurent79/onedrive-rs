@@ -54,6 +54,11 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   d'enfants, fichier = taille + mtime puis hash → un seul `PATCH`.
 - Upload : simple ≤ 4 Mio, sinon session (fragments 10 Mio) ; différé si le fichier a moins de 10 s ;
   `If-Match` cTag|eTag. Après un simple upload, mtime local aligné sur celui renvoyé (comme D).
+- Reprise des sessions d'upload (`SessionStore`, `crates/engine/src/sessions.rs`) : un JSON 0600 par envoi dans
+  `<config>/upload_sessions/` (URL pré-authentifiée, taille, mtime, expiration), réutilisé seulement si le fichier est
+  inchangé ; reprise à `nextExpectedRanges`. Avant de reprendre un remplacement, cTag/eTag en ligne revérifié (sinon la
+  reprise écraserait une modification en ligne). 403/404/410/416 = session perdue (jeton `tempauth` expiré, cf. D) →
+  nouvelle session ; erreur transitoire → session gardée pour la passe suivante ; sessions expirées purgées.
 - Filtres (deux sens) : `skip_file` (défaut `~*|.~*|*.tmp|*.swp|*.partial`, les entrées utilisateur
   s'ajoutent), `skip_dir` (nom partout / chemin exact), `skip_dotfiles`, noms refusés par OneDrive.
 - Permissions : dossiers 0700, fichiers 0600 (défauts D).
@@ -137,8 +142,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
-  uploads en session après redémarrage, progression des envois, application Entra dédiée, paquet RPM.
+- À faire : sync sélective (`sync_list`), éléments partagés (`remote`), progression des envois, application Entra dédiée, paquet RPM.
 
 ## Conventions
 

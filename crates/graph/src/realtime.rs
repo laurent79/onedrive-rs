@@ -124,19 +124,19 @@ async fn session(endpoint: &Endpoint, tx: &mpsc::UnboundedSender<Signal>, backof
             Ok(None) => return Err("connection closed".into()),
             Ok(Some(Err(e))) => return Err(e.to_string()),
             Ok(Some(Ok(Message::Close(frame)))) => return Err(format!("closed by the server: {frame:?}")),
-            Ok(Some(Ok(Message::Text(t)))) => match {
+            Ok(Some(Ok(Message::Text(t)))) => {
                 tracing::trace!(text = t.as_str(), "realtime: received");
-                parse(&t)
-            } {
-                Packet::Other => tracing::debug!(text = t.as_str(), "realtime: unexpected packet"),
-                Packet::Ping => sink.send(Message::text("3")).await.map_err(|e| e.to_string())?,
-                Packet::Event { name } if name == "notification" => {
-                    tracing::debug!("realtime notification");
-                    tx.send(Signal::Changed).map_err(|_| "closed".to_owned())?;
+                match parse(&t) {
+                    Packet::Other => tracing::debug!(text = t.as_str(), "realtime: unexpected packet"),
+                    Packet::Ping => sink.send(Message::text("3")).await.map_err(|e| e.to_string())?,
+                    Packet::Event { name } if name == "notification" => {
+                        tracing::debug!("realtime notification");
+                        tx.send(Signal::Changed).map_err(|_| "closed".to_owned())?;
+                    }
+                    Packet::Disconnect => return Err("disconnected by the server".into()),
+                    Packet::Open { .. } | Packet::Pong | Packet::Connected(_) | Packet::Event { .. } => {}
                 }
-                Packet::Disconnect => return Err("disconnected by the server".into()),
-                Packet::Open { .. } | Packet::Pong | Packet::Connected(_) | Packet::Event { .. } => {}
-            },
+            }
             // WebSocket pings are answered by tungstenite itself.
             Ok(Some(Ok(other))) => tracing::trace!(message = ?other, "realtime: non-text message"),
         }

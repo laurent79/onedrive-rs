@@ -223,6 +223,10 @@ impl Paths {
     fn lock(&self) -> PathBuf {
         self.config_dir.join("lock")
     }
+    /// Interrupted upload sessions, resumed by the next pass.
+    fn upload_sessions(&self) -> PathBuf {
+        self.config_dir.join("upload_sessions")
+    }
 }
 
 fn default_sync_dir() -> Result<PathBuf> {
@@ -294,6 +298,7 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             let (mut targets, mode) = args.resolve(&cfg)?;
             for t in &mut targets {
                 t.opts.dry_run = dry_run;
+                t.opts.upload_sessions = Some(paths.upload_sessions());
             }
             sync(&paths, auth, targets, mode).await
         }
@@ -311,7 +316,10 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
         }
         Command::Resync { drives, yes } => resync(&paths, &cfg, drives, yes).await,
         Command::Daemon { args, interval } => {
-            let (targets, mode) = args.resolve(&cfg)?;
+            let (mut targets, mode) = args.resolve(&cfg)?;
+            for t in &mut targets {
+                t.opts.upload_sessions = Some(paths.upload_sessions());
+            }
             let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
             daemon::run(&paths, auth, cfg.clone(), targets, mode, interval).await
         }

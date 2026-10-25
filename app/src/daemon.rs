@@ -564,6 +564,7 @@ impl DriveManager for Manager {
         opts.drive_id = Some(drive_id);
         if let Some(main) = drives.targets.first() {
             opts.max_transfers = main.opts.max_transfers;
+            opts.upload_sessions = main.opts.upload_sessions.clone();
         }
         drives.targets.push(Target { name: name.clone(), opts });
         drives.version += 1;

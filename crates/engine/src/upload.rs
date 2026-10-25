@@ -84,6 +84,9 @@ impl<'a> UploadSync<'a> {
             tracing::info!("dry run: no change will be made online or locally");
         }
         self.root_drive = Some(root.drive_id.clone());
+        if let Some(dir) = self.opts.upload_sessions.as_deref().filter(|_| !self.opts.dry_run) {
+            crate::sessions::prune(dir);
+        }
         self.store.begin()?;
         let moved = self.apply_moves(&root).await;
         self.store.commit()?;
@@ -408,8 +411,16 @@ impl<'a> UploadSync<'a> {
         let path = self.local_path(&rel);
         let device = self.opts.device_name.clone();
         let file_mode = self.opts.file_mode;
+        let session = self.opts.upload_sessions.as_deref().map(|dir| {
+            let key = match &target {
+                UploadTarget::New { drive_id, parent_id, name } => format!("new:{drive_id}:{parent_id}:{name}"),
+                UploadTarget::Replace { drive_id, item_id, .. } => format!("replace:{drive_id}:{item_id}"),
+            };
+            crate::sessions::FileSession::new(dir, &key, &path, size, mtime)
+        });
         self.tasks.spawn(async move {
-            let result = upload(&graph, &target, &path, size, mtime, &device, file_mode).await;
+            let env = UploadEnv { device: &device, file_mode, sessions: session.as_ref().map(|s| s as &dyn odrs_graph::SessionStore) };
+            let result = upload(&graph, &target, &path, size, mtime, &env).await;
             Uploaded { rel, result }
         });
         Ok(())
@@ -497,6 +508,15 @@ impl<'a> UploadSync<'a> {
     }
 }
 
+/// What an upload needs besides the file and its target.
+struct UploadEnv<'a> {
+    /// For safeBackup names.
+    device: &'a str,
+    file_mode: u32,
+    /// Keeps a large upload's session to resume it after an interruption.
+    sessions: Option<&'a dyn odrs_graph::SessionStore>,
+}
+
 /// Upload one file. If it changed online since the last sync (HTTP 412), the
 /// local version is kept aside as a safeBackup (uploaded as a new file on the
 /// next pass) and the current online version is downloaded in its place, as
@@ -507,15 +527,15 @@ async fn upload(
     path: &std::path::Path,
     size: u64,
     mtime: i64,
-    device: &str,
-    file_mode: u32,
+    env: &UploadEnv<'_>,
 ) -> Result<Outcome, Error> {
+    let UploadEnv { device, file_mode, sessions } = *env;
     let local_hash = crate::download::hash_file(path.to_owned()).await?;
     let mtime_str = OffsetDateTime::from_unix_timestamp(mtime).map(format_db_time).unwrap_or_default();
     let drive_id = match target {
         UploadTarget::New { drive_id, .. } | UploadTarget::Replace { drive_id, .. } => drive_id.clone(),
     };
-    let uploaded = match graph.upload_file(target, path, size, &mtime_str).await {
+    let uploaded = match graph.upload_file(target, path, size, &mtime_str, sessions).await {
         Ok(item) => item,
         Err(e) if e.status() == Some(412) => {
             let UploadTarget::Replace { item_id, .. } = target else { return Err(e.into()) };

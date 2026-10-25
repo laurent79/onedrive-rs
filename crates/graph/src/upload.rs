@@ -1,8 +1,9 @@
 //! Write operations: folder creation, deletion and file uploads.
 //!
 //! File content is always streamed from disk, never buffered whole: simple
-//! uploads up to [`SIMPLE_UPLOAD_MAX`], resumable upload sessions in
-//! [`CHUNK_SIZE`] fragments above that (like the D client).
+//! uploads up to [`SIMPLE_UPLOAD_MAX`], upload sessions in [`CHUNK_SIZE`]
+//! fragments above that (like the D client). A session kept in a
+//! [`SessionStore`] continues where it stopped after an interruption.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,6 +35,37 @@ pub enum UploadTarget {
 #[serde(rename_all = "camelCase")]
 struct UploadSession {
     upload_url: String,
+    expiration_date_time: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionStatus {
+    #[serde(default)]
+    next_expected_ranges: Vec<String>,
+}
+
+/// Keeps the upload session of one file between runs (D: `session_upload.*`
+/// files), so that an interrupted upload continues where it stopped.
+pub trait SessionStore: Send + Sync {
+    /// The session URL saved for this upload, if the file did not change since.
+    fn load(&self) -> Option<String>;
+    fn save(&self, upload_url: &str, expiration: Option<&str>);
+    fn clear(&self);
+}
+
+/// The session URL no longer works: expired (its `tempauth` token can expire
+/// before the session, as D notes: 403), gone, or out of sync with the file.
+fn session_gone(e: &Error) -> bool {
+    matches!(e.status(), Some(403 | 404 | 410 | 416))
+}
+
+/// Worth keeping the session to continue later (network, server, throttling).
+fn transient(e: &Error) -> bool {
+    match e {
+        Error::Http(_) | Error::Io(_) => true,
+        _ => matches!(e.status(), Some(408 | 429 | 500..=599)),
+    }
 }
 
 /// Percent-encode one path segment for `items/{id}:/{name}:` addressing.
@@ -100,12 +132,68 @@ impl Graph {
     }
 
     /// Upload `path` (`size` bytes, last modified `mtime` RFC 3339) to `target`.
-    pub async fn upload_file(&self, target: &UploadTarget, path: &Path, size: u64, mtime: &str) -> Result<DriveItem> {
+    /// Above [`SIMPLE_UPLOAD_MAX`], `sessions` (if any) keeps the session for a later resume.
+    pub async fn upload_file(
+        &self,
+        target: &UploadTarget,
+        path: &Path,
+        size: u64,
+        mtime: &str,
+        sessions: Option<&dyn SessionStore>,
+    ) -> Result<DriveItem> {
         if size <= SIMPLE_UPLOAD_MAX {
-            self.upload_simple(target, path, size).await
-        } else {
-            self.upload_session(target, path, size, mtime).await
+            return self.upload_simple(target, path, size).await;
         }
+        if let Some(store) = sessions
+            && let Some(url) = store.load()
+        {
+            match self.resume_offset(target, &url).await? {
+                Some(offset) if offset < size => {
+                    tracing::info!(path = %path.display(), offset, size, "resuming an interrupted upload");
+                    match self.upload_chunks(&url, path, size, offset).await {
+                        Ok(item) => {
+                            store.clear();
+                            return Ok(item);
+                        }
+                        Err(e) if session_gone(&e) => {
+                            tracing::info!(path = %path.display(), error = %e, "upload session lost, starting again");
+                            store.clear();
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => {
+                    store.clear();
+                    let _ = self.http.delete(&url).send().await;
+                }
+            }
+        }
+        self.upload_session(target, path, size, mtime, sessions).await
+    }
+
+    /// Where a saved session continues, or `None` if it cannot be used: gone on
+    /// the server, or the file it replaces changed online since (resuming would
+    /// overwrite that change; a new session then fails `If-Match` as it should).
+    async fn resume_offset(&self, target: &UploadTarget, upload_url: &str) -> Result<Option<u64>> {
+        if let UploadTarget::Replace { drive_id, item_id, if_match: Some(tag) } = target {
+            match self.get_item(drive_id, item_id).await {
+                Ok(item) if item.c_tag.as_ref() == Some(tag) || item.e_tag.as_ref() == Some(tag) => {}
+                Ok(_) => return Ok(None),
+                Err(e) if e.status() == Some(404) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        let resp = self.http.get(upload_url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            if matches!(status, 403 | 404 | 410) {
+                return Ok(None);
+            }
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Status { status, url: "upload session".into(), body });
+        }
+        let status: SessionStatus = serde_json::from_slice(&resp.bytes().await?)?;
+        Ok(status.next_expected_ranges.first().and_then(|r| r.split('-').next()?.parse().ok()))
     }
 
     async fn upload_simple(&self, target: &UploadTarget, path: &Path, size: u64) -> Result<DriveItem> {
@@ -133,7 +221,14 @@ impl Graph {
         Ok(serde_json::from_slice(&resp.bytes().await?)?)
     }
 
-    async fn upload_session(&self, target: &UploadTarget, path: &Path, size: u64, mtime: &str) -> Result<DriveItem> {
+    async fn upload_session(
+        &self,
+        target: &UploadTarget,
+        path: &Path,
+        size: u64,
+        mtime: &str,
+        sessions: Option<&dyn SessionStore>,
+    ) -> Result<DriveItem> {
         let (url, if_match, behaviour) = match target {
             UploadTarget::New { drive_id, parent_id, name } => {
                 (format!("{}/createUploadSession", child_url(drive_id, parent_id, name)), None, "fail")
@@ -158,17 +253,32 @@ impl Graph {
             })
             .await?;
         let session: UploadSession = serde_json::from_slice(&resp.bytes().await?)?;
-        let result = self.upload_chunks(&session.upload_url, path, size).await;
-        if result.is_err() {
-            // Best effort: free the server-side session.
-            let _ = self.http.delete(&session.upload_url).send().await;
+        if let Some(store) = sessions {
+            store.save(&session.upload_url, session.expiration_date_time.as_deref());
+        }
+        let result = self.upload_chunks(&session.upload_url, path, size, 0).await;
+        match &result {
+            Ok(_) => {
+                if let Some(store) = sessions {
+                    store.clear();
+                }
+            }
+            // Kept for the next pass, which continues where this one stopped.
+            Err(e) if sessions.is_some() && transient(e) => {}
+            Err(_) => {
+                if let Some(store) = sessions {
+                    store.clear();
+                }
+                // Best effort: free the server-side session.
+                let _ = self.http.delete(&session.upload_url).send().await;
+            }
         }
         result
     }
 
-    /// PUT the fragments to the pre-authenticated session URL (no bearer token).
-    async fn upload_chunks(&self, upload_url: &str, path: &Path, size: u64) -> Result<DriveItem> {
-        let mut offset = 0;
+    /// PUT the fragments from `start` to the pre-authenticated session URL (no bearer token).
+    async fn upload_chunks(&self, upload_url: &str, path: &Path, size: u64, start: u64) -> Result<DriveItem> {
+        let mut offset = start;
         loop {
             let len = CHUNK_SIZE.min(size - offset);
             let mut attempt = 0;
