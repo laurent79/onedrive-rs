@@ -1,6 +1,7 @@
 //! `onedrive-rs daemon`: periodic sync passes over every configured drive,
 //! controlled over D-Bus.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,8 +27,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 const OFFLINE_RETRY: Duration = Duration::from_secs(60);
 /// Quiet time after a local change before starting a pass.
 const DEBOUNCE: Duration = Duration::from_secs(5);
-/// Quiet time after an online change notification: they come in bursts.
-const REMOTE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Quiet time after an online change notification. Repeated notifications
+/// for one change come seconds apart: waiting longer would not merge them.
+const REMOTE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Retry delay to find the main drive's id for its notifications (offline at start).
 const DRIVE_ID_RETRY: Duration = Duration::from_secs(60);
 
@@ -89,7 +91,10 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut paused = false;
+    // Next full pass (every drive), and an earlier one for drives notified of online changes.
     let mut next = Instant::now();
+    let mut remote_next: Option<Instant> = None;
+    let mut notified: HashSet<String> = HashSet::new();
     loop {
         // Apply drive list changes (startup, AddDrive, RemoveDrive).
         let (targets, version, removed, resync) = {
@@ -143,7 +148,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         }
 
         // Wait for the next pass, a command or a shutdown signal.
-        let wake = tokio::time::sleep_until(next.into());
+        let wake = tokio::time::sleep_until(remote_next.map_or(next, |r| r.min(next)).into());
         tokio::select! {
             _ = wake, if !paused => {}
             Some(path) = local_change(&mut local_rx) => {
@@ -155,7 +160,9 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
                 match signal {
                     odrs_graph::realtime::Signal::Changed => {
                         tracing::info!(drive, "online change notified");
-                        next = next.min(Instant::now() + REMOTE_DEBOUNCE);
+                        let at = Instant::now() + REMOTE_DEBOUNCE;
+                        remote_next = Some(remote_next.map_or(at, |r| r.min(at)));
+                        notified.insert(drive);
                     }
                     odrs_graph::realtime::Signal::Connected => tracing::info!(drive, "online changes now notified in near real time"),
                     odrs_graph::realtime::Signal::Disconnected => tracing::debug!(drive, "online change notifications interrupted"),
@@ -183,12 +190,22 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             _ = sigterm.recv() => break,
         }
 
+        // A pass brought forward by notifications only covers the notified drives.
+        let full = Instant::now() >= next;
+        let only = if full {
+            notified.clear();
+            None
+        } else {
+            Some(std::mem::take(&mut notified))
+        };
+        remote_next = None;
+
         server.set_state(State::Syncing).await?;
         let shared = Arc::new(Mutex::new(statuses.clone()));
         let started = Instant::now();
         let mut sync_requested = false;
         let outcome = tokio::select! {
-            r = run_pass(&graph, &store, &targets, mode, &server, &shared, &event_ids) => Some(r),
+            r = run_pass(&graph, &store, selected(&targets, only.as_ref()), mode, &server, &shared, &event_ids) => Some(r),
             () = until_pause(&mut rx, &mut sync_requested) => None,
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -205,9 +222,11 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             server.set_state(State::Paused).await?;
             continue;
         };
-        tracing::info!(elapsed = ?started.elapsed(), "pass finished");
+        tracing::info!(elapsed = ?started.elapsed(), drives = only.as_ref().map_or(targets.len(), HashSet::len), "pass finished");
         server.set_progress(outcome.total).await?;
-        if outcome.failures.is_empty() && outcome.total.errors == 0 {
+        if outcome.failures.is_empty() && outcome.total.errors == 0 && only.is_some() && statuses.iter().any(|s| s.state == "error") {
+            // Another drive, not part of this pass, is still in error: keep showing it.
+        } else if outcome.failures.is_empty() && outcome.total.errors == 0 {
             server.finish_pass(Ok(now_rfc3339())).await?;
             server.set_state(State::Idle).await?;
         } else if outcome.failures.is_empty() {
@@ -225,11 +244,13 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             server.finish_pass(Err(msg)).await?;
             server.set_state(State::Error).await?;
             if outcome.failures.iter().any(|(_, e)| e.is_network()) {
-                next = Instant::now() + OFFLINE_RETRY;
+                next = if full { Instant::now() + OFFLINE_RETRY } else { next.min(Instant::now() + OFFLINE_RETRY) };
                 continue;
             }
         }
-        next = Instant::now() + interval;
+        if full {
+            next = Instant::now() + interval;
+        }
         if outcome.deferred > 0 {
             // Files that were still being written: pick them up shortly.
             next = next.min(Instant::now() + 2 * DEBOUNCE);
@@ -317,19 +338,24 @@ struct PassOutcome {
     deferred: u64,
 }
 
+/// The drives of a pass with their index in the statuses: all, or `only` those.
+fn selected<'a>(targets: &'a [Target], only: Option<&HashSet<String>>) -> Vec<(usize, &'a Target)> {
+    targets.iter().enumerate().filter(|(_, t)| only.is_none_or(|o| o.contains(&t.name))).collect()
+}
+
 /// One pass over every drive, in order; a failing drive does not stop the
 /// others. `statuses` is updated live and published with the progress.
 async fn run_pass(
     graph: &Arc<Graph>,
     store: &Store,
-    targets: &[Target],
+    targets: Vec<(usize, &Target)>,
     mode: SyncMode,
     server: &Server,
     statuses: &Arc<Mutex<Vec<DriveStatus>>>,
     event_ids: &AtomicU64,
 ) -> PassOutcome {
     let mut out = PassOutcome { failures: Vec::new(), total: Progress::default(), deferred: 0 };
-    for (i, t) in targets.iter().enumerate() {
+    for (i, t) in targets {
         let stats = Arc::new(Stats::default());
         let started = Instant::now();
         set_status(statuses, i, |s| {
