@@ -74,11 +74,45 @@ Command-line options take precedence.
 | `skip_file` | added to `~*\|.~*\|*.tmp\|*.swp\|*.partial` |
 | `skip_dir` | none; a name skips it anywhere, a path (`Documents/Old`) only there |
 | `skip_dotfiles` | `false` |
+| `sync_root_files` | `false`; with a `sync_list`, also sync the files at the top of the sync folder |
 | `classify_as_big_delete` | `1000`: refuse to delete more items online in one pass |
 | `sync_dir_permissions` / `sync_file_permissions` | `700` / `600` |
 | `application_id` | the D client's public Entra application |
 
-Files: `refresh_token` (mode 0600), `items.sqlite3` (D client schema), `lock`.
+A `[drive "name"]` section may set its own `skip_file`, `skip_dir`,
+`skip_dotfiles` and `sync_root_files`; they replace the top-level values for
+that drive.
+
+### Selective sync
+
+As with the D client, a `sync_list` file next to the config limits the sync to
+what it lists (`sync_list.<name>` for a `[drive "name"]`). Everything else is
+excluded; exclusion rules win over inclusions:
+
+```text
+# The Documents folder at the top, and everything in it
+/Documents
+# Only this folder inside Teams (Teams itself is created, nothing else in it)
+/Teams/Engineering/
+# But not this one
+!/Documents/Old
+# Any folder named node_modules, at any depth
+!node_modules/
+```
+
+A leading `/` anchors a rule at the top of the sync folder; without it, the
+rule matches at any depth (and every folder is then synced, in case it contains
+a match). A trailing `/` (or `/*`) only matches folders. `*` and `?` match
+within a name, `**` any number of folders.
+
+Unlike the D client, no `--resync` is needed after changing `sync_list` or a
+`skip_*` option: the next pass notices it, forgets what is now excluded and
+enumerates the drive again to bring in what is now included. Local copies of
+excluded items are kept (and never uploaded); identical local files are not
+downloaded again.
+
+Files: `refresh_token` (mode 0600), `items.sqlite3` (D client schema), `lock`,
+`upload_sessions/` (interrupted uploads), `filters/` (filters of the previous pass).
 Daemon log: `journalctl --user -u onedrive-rs`.
 
 ## Behaviour in short

@@ -139,6 +139,10 @@ impl<'a> UploadSync<'a> {
 
         for child in self.store.children(&dir.drive_id, &dir.id)? {
             let child_rel = Self::join(rel, &child.name);
+            if self.excluded(&child, &child_rel) {
+                local.remove(&child.name);
+                continue;
+            }
             match (child.item_type, local.remove(&child.name)) {
                 (_, None | Some(LocalState::Absent)) if self.moved_old.contains(&child_rel) => {}
                 (_, None | Some(LocalState::Absent)) => self.deletions.push((child, child_rel)),
@@ -183,6 +187,11 @@ impl<'a> UploadSync<'a> {
         Ok(())
     }
 
+    /// A recorded item the filters exclude (not forgotten yet): never an online deletion.
+    fn excluded(&self, item: &Item, rel: &str) -> bool {
+        self.opts.filters.excludes(&item.name, rel, item.item_type == ItemType::Dir)
+    }
+
     /// Local entries worth a move check: valid names not excluded by filters.
     fn local_entries(&self, rel: &str) -> Result<HashMap<String, LocalState>, Error> {
         let mut out = HashMap::new();
@@ -211,6 +220,9 @@ impl<'a> UploadSync<'a> {
             if let Some(dir) = dir {
                 for child in self.store.children(&dir.drive_id, &dir.id)? {
                     let child_rel = Self::join(&rel, &child.name);
+                    if self.excluded(&child, &child_rel) {
+                        continue;
+                    }
                     match local.remove(&child.name) {
                         None | Some(LocalState::Absent) => {
                             let children: BTreeSet<String> = match child.item_type {

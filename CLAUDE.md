@@ -60,7 +60,19 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   reprise écraserait une modification en ligne). 403/404/410/416 = session perdue (jeton `tempauth` expiré, cf. D) →
   nouvelle session ; erreur transitoire → session gardée pour la passe suivante ; sessions expirées purgées.
 - Filtres (deux sens) : `skip_file` (défaut `~*|.~*|*.tmp|*.swp|*.partial`, les entrées utilisateur
-  s'ajoutent), `skip_dir` (nom partout / chemin exact), `skip_dotfiles`, noms refusés par OneDrive.
+  s'ajoutent), `skip_dir` (nom partout / chemin exact), `skip_dotfiles`, noms refusés par OneDrive. Une section
+  `[drive]` peut redéfinir `skip_*`/`sync_root_files` (remplacent les valeurs globales pour ce drive).
+- Sync sélective (`filter::SyncList`, `sync_list` de D) : `<config>/sync_list` (main), `sync_list.<nom>` (drive),
+  relu à chaque passe. Tout exclu sauf inclusions ; exclusions (`!`/`-`) prioritaires ; `/` initial = ancré, sinon
+  à toute profondeur (tous les dossiers deviennent alors des chemins possibles) ; `/` ou `/*` final = dossier ;
+  `*`, `?`, `**` ; insensible à la casse ; les dossiers menant à une inclusion sont synchronisés (sans le reste).
+  Sémantique documentée de D, pas ses heuristiques (sous-chaînes, regex). Règles refusées comme D (`/`, `/*`, `./`).
+- Changement de filtres (`selective.rs`) : empreinte des règles par drive dans `<config>/filters/` ; si elle change,
+  lignes DB exclues oubliées (copies locales gardées : exclues, donc jamais envoyées), deltaLink effacé → énumération
+  complète qui rattache sans télécharger. Première fois : empreinte seulement enregistrée. D exige `--resync`.
+  Élément suivi déplacé en ligne vers une zone exclue = suppression locale (si inchangé) ; parent hors base reconnu
+  seulement s'il a été exclu pendant la passe (`excluded_dirs`, comme `skippedItems` de D : `/delta` ne garantit
+  pas l'ordre parent/enfant). Côté envoi, une ligne DB exclue n'est jamais une suppression en ligne.
 - Permissions : dossiers 0700, fichiers 0600 (défauts D).
 - Changements en ligne quasi instantanés (`odrs_graph::realtime`, comme `socketio.d` de D) : par drive,
   `GET /drives/{id}/root/subscriptions/socketIo` → `notificationUrl`, WebSocket Socket.IO v4 (`40`, `40/notifications`,
@@ -120,7 +132,8 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
   `fileSystemInfo.lastModifiedDateTime` ; `size` en TEXT ; `syncStatus = "Y"` ; racine sans `parentId`.
 - Upsert `ON CONFLICT DO UPDATE`, **jamais `INSERT OR REPLACE`** (supprime la ligne → cascade sur les enfants).
 - Plusieurs drives dans une même DB (lignes distinguées par `driveId`) : `import-d` fusionne la DB d'une
-  instance D dédiée à une bibliothèque (`Store::merge_drive`).
+  instance D dédiée à une bibliothèque (`Store::merge_drive`). `import-d` reprend aussi les `skip_*`,
+  `sync_root_files` et le `sync_list` de D (la DB importée en tient compte).
 
 ## Développement
 
@@ -142,7 +155,8 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : sync sélective (`sync_list`), éléments partagés (`remote`), progression des envois, application Entra dédiée, paquet RPM.
+- À faire : sélection des dossiers dans la GUI (sync sélective), éléments partagés (`remote`), progression des
+  envois, application Entra dédiée, paquet RPM.
 
 ## Conventions
 

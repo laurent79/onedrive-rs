@@ -4,13 +4,18 @@
 //!
 //! Top-level keys describe the account's own OneDrive. Other drives
 //! (SharePoint document libraries) are added as sections, all synced by the
-//! same daemon with the same login and filters:
+//! same daemon with the same login. A section may set its own filters, which
+//! replace the top-level ones for that drive:
 //!
 //! ```text
 //! [drive "Engineering"]
 //! drive_id = "b!8mPT…"
 //! sync_dir = "~/SharePoint/Engineering"
+//! skip_dir = "build"
 //! ```
+//!
+//! Selective sync rules live next to the config file, as in the D client:
+//! `sync_list` for the account's OneDrive, `sync_list.<name>` for a drive.
 
 use std::path::{Path, PathBuf};
 
@@ -23,9 +28,7 @@ pub struct Config {
     pub threads: Option<usize>,
     pub monitor_interval: Option<u64>,
     pub download_only: Option<bool>,
-    pub skip_file: Option<String>,
-    pub skip_dir: Option<String>,
-    pub skip_dotfiles: Option<bool>,
+    pub filters: FilterConfig,
     pub classify_as_big_delete: Option<u64>,
     /// No near-real-time notifications of online changes (D's option name).
     pub disable_websocket_support: Option<bool>,
@@ -37,11 +40,62 @@ pub struct Config {
     pub drives: Vec<DriveConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DriveConfig {
     pub name: String,
     pub drive_id: String,
     pub sync_dir: PathBuf,
+    /// Set keys replace the top-level ones for this drive.
+    pub filters: FilterConfig,
+}
+
+/// Client-side filtering options (both directions).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FilterConfig {
+    /// Added to the default `skip_file` of the D client.
+    pub skip_file: Option<String>,
+    pub skip_dir: Option<String>,
+    pub skip_dotfiles: Option<bool>,
+    /// With a `sync_list`, also sync the files at the top of the sync folder.
+    pub sync_root_files: Option<bool>,
+}
+
+impl FilterConfig {
+    /// Handle a filter key; `false` if `key` is not one.
+    fn set(&mut self, key: &str, value: &str, line: usize) -> Result<bool> {
+        match key {
+            "skip_file" => append(&mut self.skip_file, value),
+            "skip_dir" => append(&mut self.skip_dir, value),
+            "skip_dotfiles" => self.skip_dotfiles = Some(boolean(value, line)?),
+            "sync_root_files" => self.sync_root_files = Some(boolean(value, line)?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// This drive's keys, the top-level ones for the others.
+    fn over(&self, top: &Self) -> Self {
+        Self {
+            skip_file: self.skip_file.clone().or_else(|| top.skip_file.clone()),
+            skip_dir: self.skip_dir.clone().or_else(|| top.skip_dir.clone()),
+            skip_dotfiles: self.skip_dotfiles.or(top.skip_dotfiles),
+            sync_root_files: self.sync_root_files.or(top.sync_root_files),
+        }
+    }
+
+    /// The set keys and their values.
+    pub fn entries(&self) -> Vec<(&'static str, String)> {
+        [("skip_file", self.skip_file.clone()), ("skip_dir", self.skip_dir.clone())]
+            .into_iter()
+            .chain([("skip_dotfiles", self.skip_dotfiles), ("sync_root_files", self.sync_root_files)].map(|(k, v)| (k, v.map(|b| b.to_string()))))
+            .filter_map(|(key, value)| Some((key, value?)))
+            .collect()
+    }
+}
+
+/// Selective sync rules of a drive (`main`: the account's own OneDrive).
+pub fn sync_list_path(config_dir: &Path, drive: &str) -> PathBuf {
+    if drive == "main" { config_dir.join("sync_list") } else { config_dir.join(format!("sync_list.{drive}")) }
 }
 
 impl Config {
@@ -56,8 +110,8 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let mut c = Self::default();
-        // Current [drive "name"] section: (name, drive_id, sync_dir, header line).
-        let mut section: Option<(String, Option<String>, Option<PathBuf>, usize)> = None;
+        // Current [drive "name"] section (drive_id, sync_dir may still be empty) and its header line.
+        let mut section: Option<(DriveConfig, usize)> = None;
         for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -75,18 +129,19 @@ impl Config {
                     .and_then(|n| n.strip_suffix('"'))
                     .filter(|n| !n.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("line {}: expected [drive \"name\"]", n + 1))?;
-                section = Some((name.to_owned(), None, None, n + 1));
+                section = Some((DriveConfig { name: name.to_owned(), ..Default::default() }, n + 1));
                 continue;
             }
-            if let Some((_, drive_id, sync_dir, _)) = section.as_mut() {
+            if let Some((d, _)) = section.as_mut() {
                 let Some((key, value)) = line.split_once('=') else {
                     bail!("line {}: expected `key = \"value\"`", n + 1);
                 };
                 let value = value.trim();
                 let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
                 match key.trim() {
-                    "drive_id" => *drive_id = Some(value.to_owned()),
-                    "sync_dir" => *sync_dir = Some(expand_home(value)),
+                    "drive_id" => d.drive_id = value.to_owned(),
+                    "sync_dir" => d.sync_dir = expand_home(value),
+                    other if d.filters.set(other, value, n + 1)? => {}
                     other => bail!("line {}: `{other}` is not supported in a [drive] section", n + 1),
                 }
                 continue;
@@ -104,9 +159,7 @@ impl Config {
                 "threads" => c.threads = Some(number(value, line_no)?),
                 "monitor_interval" => c.monitor_interval = Some(number(value, line_no)?),
                 "download_only" => c.download_only = Some(boolean(value, line_no)?),
-                "skip_file" => append(&mut c.skip_file, value),
-                "skip_dir" => append(&mut c.skip_dir, value),
-                "skip_dotfiles" => c.skip_dotfiles = Some(boolean(value, line_no)?),
+                other if c.filters.set(other, value, line_no)? => {}
                 "classify_as_big_delete" => c.classify_as_big_delete = Some(number(value, line_no)?),
                 "disable_websocket_support" => c.disable_websocket_support = Some(boolean(value, line_no)?),
                 // Octal digits written as a decimal number, as in the D client ("700").
@@ -127,20 +180,22 @@ impl Config {
         Ok(c)
     }
 
-    /// Engine options: defaults, then this file.
-    pub fn sync_options(&self, sync_dir: PathBuf) -> odrs_engine::SyncOptions {
+    /// Engine options: defaults, then this file (and the section of `drive`).
+    pub fn sync_options(&self, sync_dir: PathBuf, drive: Option<&DriveConfig>) -> odrs_engine::SyncOptions {
         let mut o = odrs_engine::SyncOptions::new(sync_dir);
         if let Some(t) = self.threads {
             o.max_transfers = t;
         }
+        let f = drive.map_or_else(|| self.filters.clone(), |d| d.filters.over(&self.filters));
         // Like D, user skip_file entries come on top of the defaults.
-        if let Some(extra) = &self.skip_file {
+        if let Some(extra) = &f.skip_file {
             o.filters.skip_file = odrs_engine::filter::SkipList::new(&format!("{}|{extra}", odrs_engine::filter::DEFAULT_SKIP_FILE));
         }
-        if let Some(d) = &self.skip_dir {
+        if let Some(d) = &f.skip_dir {
             o.filters.skip_dir = odrs_engine::filter::SkipDirs::new(d);
         }
-        o.filters.skip_dotfiles = self.skip_dotfiles.unwrap_or(false);
+        o.filters.skip_dotfiles = f.skip_dotfiles.unwrap_or(false);
+        o.filters.sync_root_files = f.sync_root_files.unwrap_or(false);
         if let Some(n) = self.classify_as_big_delete {
             o.big_delete_threshold = n;
         }
@@ -157,7 +212,7 @@ impl Config {
 /// Checks before adding a drive: unique name and drive, folder not overlapping
 /// any configured one (including the main `sync_dir`, `main_dir`).
 pub fn validate_new_drive(cfg: &Config, main_dir: &Path, name: &str, drive_id: &str, sync_dir: &Path) -> Result<()> {
-    if name.trim().is_empty() || name.contains(['"', '[', ']', '\n']) {
+    if name.trim().is_empty() || name.contains(['"', '[', ']', '\n', '/']) {
         bail!("invalid drive name \"{name}\"");
     }
     if name.eq_ignore_ascii_case("main") || cfg.drives.iter().any(|d| d.name.eq_ignore_ascii_case(name)) {
@@ -183,6 +238,9 @@ pub fn append_drive_section(path: &Path, d: &DriveConfig) -> Result<()> {
         text.push('\n');
     }
     text.push_str(&format!("\n[drive \"{}\"]\ndrive_id = \"{}\"\nsync_dir = \"{}\"\n", d.name, d.drive_id, d.sync_dir.display()));
+    for (key, value) in d.filters.entries() {
+        text.push_str(&format!("{key} = \"{value}\"\n"));
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -215,11 +273,11 @@ pub fn remove_drive_section(path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn finish_section((name, drive_id, sync_dir, line): (String, Option<String>, Option<PathBuf>, usize)) -> Result<DriveConfig> {
-    match (drive_id, sync_dir) {
-        (Some(drive_id), Some(sync_dir)) => Ok(DriveConfig { name, drive_id, sync_dir }),
-        _ => bail!("line {line}: [drive \"{name}\"] needs both drive_id and sync_dir"),
+fn finish_section((d, line): (DriveConfig, usize)) -> Result<DriveConfig> {
+    if d.drive_id.is_empty() || d.sync_dir.as_os_str().is_empty() {
+        bail!("line {line}: [drive \"{}\"] needs both drive_id and sync_dir", d.name);
     }
+    Ok(d)
 }
 
 fn append(slot: &mut Option<String>, value: &str) {
@@ -271,7 +329,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.drives.len(), 2);
-        assert_eq!(c.drives[1], DriveConfig { name: "Sales".into(), drive_id: "b!def".into(), sync_dir: "/srv/sales".into() });
+        let sales = DriveConfig { name: "Sales".into(), drive_id: "b!def".into(), sync_dir: "/srv/sales".into(), ..Default::default() };
+        assert_eq!(c.drives[1], sales);
         assert!(c.sync_dir.unwrap().ends_with("OneDrive"));
         assert!(Config::parse("[drive \"X\"]\ndrive_id = \"a\"").is_err(), "missing sync_dir");
         assert!(Config::parse("[drive \"X\"]\ndrive_id = \"a\"\nsync_dir = \"/a\"\nthreads = \"2\"").is_err());
@@ -283,11 +342,19 @@ mod tests {
     fn add_and_remove_sections() {
         let p = std::env::temp_dir().join(format!("odrs-sections-test-{}", std::process::id()));
         std::fs::write(&p, "sync_dir = \"/home/u/OneDrive\"\n").unwrap();
-        let d = DriveConfig { name: "Engineering".into(), drive_id: "b!a".into(), sync_dir: "/home/u/SharePoint/Engineering".into() };
+        let d = DriveConfig {
+            name: "Engineering".into(),
+            drive_id: "b!a".into(),
+            sync_dir: "/home/u/SharePoint/Engineering".into(),
+            ..Default::default()
+        };
         append_drive_section(&p, &d).unwrap();
-        append_drive_section(&p, &DriveConfig { name: "Sales".into(), drive_id: "b!b".into(), sync_dir: "/v".into() }).unwrap();
+        let filters = FilterConfig { skip_dir: Some("build|.cache".into()), skip_dotfiles: Some(true), ..Default::default() };
+        let sales = DriveConfig { name: "Sales".into(), drive_id: "b!b".into(), sync_dir: "/v".into(), filters };
+        append_drive_section(&p, &sales).unwrap();
         let c = Config::load(&p).unwrap();
         assert_eq!(c.drives.len(), 2);
+        assert_eq!(c.drives[1], sales);
         let main = Path::new("/home/u/OneDrive");
         assert!(validate_new_drive(&c, main, "engineering", "b!z", Path::new("/x")).is_err(), "name taken");
         assert!(validate_new_drive(&c, main, "X", "b!a", Path::new("/x")).is_err(), "drive taken");
@@ -319,11 +386,25 @@ mod tests {
         .unwrap();
         assert!(c.sync_dir.unwrap().ends_with("SharePoint/Engineering"));
         assert_eq!(c.threads, Some(2));
-        assert_eq!(c.skip_dir.as_deref(), Some("node_modules|/Documents/Old"));
+        assert_eq!(c.filters.skip_dir.as_deref(), Some("node_modules|/Documents/Old"));
         assert_eq!(c.sync_file_permissions, Some(0o640));
-        let o = Config::parse("skip_file = \"*.bak\"").unwrap().sync_options("/x".into());
+        let o = Config::parse("skip_file = \"*.bak\"").unwrap().sync_options("/x".into(), None);
         assert!(o.filters.skip_file.matches("a.bak") && o.filters.skip_file.matches("a.tmp"));
         assert!(Config::parse("threads = \"many\"").is_err());
+
+        // A drive's own filter keys replace the top-level ones.
+        let c = Config::parse(
+            "skip_dir = \"node_modules\"\nskip_dotfiles = \"true\"\n\
+             [drive \"Sales\"]\ndrive_id = \"b!s\"\nsync_dir = \"/s\"\nskip_dir = \"Archive\"\nsync_root_files = \"true\"\n",
+        )
+        .unwrap();
+        let o = c.sync_options("/s".into(), Some(&c.drives[0]));
+        assert!(o.filters.skip_dir.matches("Archive", "Archive") && !o.filters.skip_dir.matches("node_modules", "node_modules"));
+        assert!(o.filters.skip_dotfiles && o.filters.sync_root_files);
+        let main = c.sync_options("/m".into(), None);
+        assert!(main.filters.skip_dir.matches("node_modules", "node_modules") && !main.filters.sync_root_files);
+        assert_eq!(sync_list_path(Path::new("/c"), "main"), Path::new("/c/sync_list"));
+        assert_eq!(sync_list_path(Path::new("/c"), "Sales"), Path::new("/c/sync_list.Sales"));
         assert!(Config::parse("garbage").is_err());
     }
 }

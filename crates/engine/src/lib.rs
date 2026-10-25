@@ -7,6 +7,7 @@ mod download;
 pub mod filter;
 pub mod local;
 pub mod moves;
+mod selective;
 mod sessions;
 mod upload;
 pub mod verify;
@@ -81,6 +82,12 @@ pub struct SyncOptions {
     pub drive_id: Option<String>,
     /// Where interrupted upload sessions are kept to be resumed; `None`: not resumable.
     pub upload_sessions: Option<PathBuf>,
+    /// Selective sync rules (D's `sync_list` file), read again at each pass
+    /// into `filters.sync_list`; a missing file syncs everything.
+    pub sync_list_file: Option<PathBuf>,
+    /// Where the filters of each drive's previous pass are remembered, to
+    /// notice a change; `None`: filter changes are not handled.
+    pub filter_state: Option<PathBuf>,
 }
 
 impl SyncOptions {
@@ -96,6 +103,8 @@ impl SyncOptions {
             file_mode: 0o600,
             drive_id: None,
             upload_sessions: None,
+            sync_list_file: None,
+            filter_state: None,
         }
     }
 }
@@ -168,7 +177,10 @@ pub(crate) async fn resolve_drive(graph: &Graph, opts: &SyncOptions) -> Result<o
 ///
 /// In dry-run mode the online changes are not fetched at all; only the local
 /// side is compared with the database and reported.
-pub async fn sync(graph: Arc<Graph>, store: &Store, opts: SyncOptions, stats: Arc<Stats>, mode: SyncMode) -> Result<(), Error> {
+pub async fn sync(graph: Arc<Graph>, store: &Store, mut opts: SyncOptions, stats: Arc<Stats>, mode: SyncMode) -> Result<(), Error> {
+    if let Some(file) = &opts.sync_list_file {
+        opts.filters.sync_list = filter::SyncList::load(file)?;
+    }
     let drive_id = if opts.dry_run {
         let drive = resolve_drive(&graph, &opts).await?;
         match store.root(&drive.id)? {

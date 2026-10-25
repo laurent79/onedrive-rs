@@ -21,7 +21,8 @@ pub async fn run(paths: &Paths, auth: AuthConfig, from: PathBuf, name: Option<St
     let d_cfg = Config::load(&from.join("config"))?;
     if let Some(drive_id) = d_cfg.drive_id.clone() {
         let sync_dir = d_cfg.sync_dir.clone().context("the D configuration has a drive_id but no sync_dir")?;
-        return import_library(paths, auth, &d_db, drive_id, sync_dir, name, force).await;
+        let library = Library { from: &from, drive_id, sync_dir, filters: d_cfg.filters.clone() };
+        return import_library(paths, auth, &d_db, library, name, force).await;
     }
     let sync_dir = d_cfg.sync_dir.clone().unwrap_or_else(|| config::expand_home("~/OneDrive"));
 
@@ -65,6 +66,12 @@ pub async fn run(paths: &Paths, auth: AuthConfig, from: PathBuf, name: Option<St
     }
     std::fs::rename(&staging, &ours)?;
     set_config_value(&paths.config(), "sync_dir", &sync_dir.display().to_string())?;
+    // The imported database reflects D's filters: keep them.
+    for (key, value) in d_cfg.filters.entries() {
+        set_config_value(&paths.config(), key, &value)?;
+        eprintln!("{key} = \"{value}\" taken from the D configuration");
+    }
+    import_sync_list(&from, &config::sync_list_path(&paths.config_dir, "main"))?;
 
     eprintln!("Imported {} (sync cursor: {}):", d_db.display(), if has_cursor { "yes" } else { "no, a full enumeration will run" });
     for (t, n) in counts {
@@ -75,17 +82,18 @@ pub async fn run(paths: &Paths, auth: AuthConfig, from: PathBuf, name: Option<St
     Ok(())
 }
 
-/// A D client instance dedicated to one drive (a SharePoint library): merge its
-/// rows into our database and add a `[drive]` section to our config.
-async fn import_library(
-    paths: &Paths,
-    auth: AuthConfig,
-    d_db: &Path,
+/// The D configuration of a library instance.
+struct Library<'a> {
+    from: &'a Path,
     drive_id: String,
     sync_dir: PathBuf,
-    name: Option<String>,
-    force: bool,
-) -> Result<()> {
+    filters: config::FilterConfig,
+}
+
+/// A D client instance dedicated to one drive (a SharePoint library): merge its
+/// rows into our database and add a `[drive]` section to our config.
+async fn import_library(paths: &Paths, auth: AuthConfig, d_db: &Path, library: Library<'_>, name: Option<String>, force: bool) -> Result<()> {
+    let Library { from, drive_id, sync_dir, filters } = library;
     let name = name
         .or_else(|| sync_dir.file_name().map(|n| n.to_string_lossy().into_owned()))
         .context("cannot derive a drive name; use --name")?;
@@ -115,12 +123,30 @@ async fn import_library(
     let has_cursor = store.delta_link(&root.drive_id, &root.id)?.is_some();
 
     if !already {
-        config::append_drive_section(&paths.config(), &config::DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone() })?;
+        let section = config::DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone(), filters };
+        config::append_drive_section(&paths.config(), &section)?;
+        import_sync_list(from, &config::sync_list_path(&paths.config_dir, &name))?;
     }
     let kind = drive.drive_type.as_deref().unwrap_or("?");
     eprintln!("Imported {rows} items of {kind} drive \"{name}\" ({drive_id}), sync cursor: {}", if has_cursor { "yes" } else { "no" });
     eprintln!("Folder: {} (added as [drive \"{name}\"] in {})", sync_dir.display(), paths.config().display());
     eprintln!("Keep that D client stopped from now on, then restart onedrive-rs.");
+    Ok(())
+}
+
+/// Copy D's selective sync rules (the imported database reflects them), unless
+/// we already have some.
+fn import_sync_list(from: &Path, to: &Path) -> Result<()> {
+    let source = from.join("sync_list");
+    if !source.exists() {
+        return Ok(());
+    }
+    if to.exists() {
+        eprintln!("{} not copied: {} already exists", source.display(), to.display());
+        return Ok(());
+    }
+    std::fs::copy(&source, to).with_context(|| format!("copying {}", source.display()))?;
+    eprintln!("Selective sync rules copied to {}", to.display());
     Ok(())
 }
 

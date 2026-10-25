@@ -37,6 +37,8 @@ pub struct DownloadSync<'a> {
     tasks: JoinSet<Outcome>,
     in_flight: HashSet<String>,
     keep_local_deletions: bool,
+    /// Folders excluded (or below an excluded folder) seen during this pass.
+    excluded_dirs: HashSet<String>,
 }
 
 impl<'a> DownloadSync<'a> {
@@ -50,6 +52,7 @@ impl<'a> DownloadSync<'a> {
             tasks: JoinSet::new(),
             in_flight: HashSet::new(),
             keep_local_deletions: false,
+            excluded_dirs: HashSet::new(),
         }
     }
 
@@ -75,6 +78,9 @@ impl<'a> DownloadSync<'a> {
         let root_drive = root_item.drive_id.clone();
         if self.store.get(&root_drive, &root_item.id)?.is_none() {
             self.store.upsert(&root_item)?;
+        }
+        if let Some(dir) = &self.opts.filter_state {
+            crate::selective::apply_filter_change(self.store, &root_item, &self.opts.filters, dir)?;
         }
         // Overall progress: what is already synced versus the size of the whole drive.
         self.stats.drive_bytes.store(root.size.unwrap_or(0).max(0) as u64, Ordering::Relaxed);
@@ -159,6 +165,14 @@ impl<'a> DownloadSync<'a> {
         let Some(parent_rel) = self.store.path_of(&drive_id, parent_id)? else {
             tracing::debug!(id = %item.id, name = ?item.name, "parent not in database, skipping");
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            // Only a parent excluded during this pass says where the item went
+            // (like D's skippedItems): a tracked item moved into it left the synced tree.
+            if self.excluded_dirs.contains(parent_id) {
+                if item.is_folder() {
+                    self.excluded_dirs.insert(item.id.clone());
+                }
+                return self.apply_excluded(&drive_id, &item.id).await;
+            }
             return Ok(());
         };
         let name = item.name.as_deref().unwrap_or("");
@@ -168,9 +182,12 @@ impl<'a> DownloadSync<'a> {
         let rel = if parent_rel.is_empty() { name.to_owned() } else { format!("{parent_rel}/{name}") };
         // Like the D client, filters apply to downloads as well as uploads.
         if self.opts.filters.excludes(name, &rel, item.is_folder()) {
-            tracing::debug!(path = %rel, "excluded by skip_file/skip_dir/skip_dotfiles");
+            tracing::debug!(path = %rel, "excluded by skip_file/skip_dir/skip_dotfiles/sync_list");
             self.stats.skipped.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            if item.is_folder() {
+                self.excluded_dirs.insert(item.id.clone());
+            }
+            return self.apply_excluded(&drive_id, &item.id).await;
         }
         let db = to_db_item(item, &self.drive_id)?;
 
@@ -193,6 +210,20 @@ impl<'a> DownloadSync<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// A tracked item now excluded or in an excluded folder: it was moved or
+    /// renamed online to an excluded place (rule changes are handled before
+    /// the pass). For this client it left the synced tree, like a deletion; if
+    /// its previous path is excluded as well, only forget it.
+    async fn apply_excluded(&mut self, drive_id: &str, id: &str) -> Result<(), Error> {
+        let Some(prev) = self.store.get(drive_id, id)? else { return Ok(()) };
+        let Some(old_rel) = self.store.path_of(drive_id, id)? else { return Ok(()) };
+        if self.opts.filters.excludes(&prev.name, &old_rel, prev.item_type == ItemType::Dir) {
+            return Ok(self.store.delete(drive_id, id)?);
+        }
+        tracing::info!(path = %old_rel, "moved online to an excluded place");
+        self.apply_delete(drive_id, id).await
     }
 
     /// The item already exists in the DB under another path: move the local copy along.

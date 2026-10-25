@@ -90,6 +90,11 @@ pub fn device_name() -> String {
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
+/// Stable across runs and Rust versions (unlike `DefaultHasher`).
+pub(crate) fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -151,9 +151,9 @@ impl SyncArgs {
             Some(d) => d,
             None => default_sync_dir()?,
         };
-        let mut targets = vec![Target { name: "main".into(), opts: cfg.sync_options(main_dir) }];
+        let mut targets = vec![Target { name: "main".into(), opts: cfg.sync_options(main_dir, None) }];
         for d in &cfg.drives {
-            let mut opts = cfg.sync_options(d.sync_dir.clone());
+            let mut opts = cfg.sync_options(d.sync_dir.clone(), Some(d));
             opts.drive_id = Some(d.drive_id.clone());
             targets.push(Target { name: d.name.clone(), opts });
         }
@@ -227,6 +227,13 @@ impl Paths {
     fn upload_sessions(&self) -> PathBuf {
         self.config_dir.join("upload_sessions")
     }
+    /// Files kept next to the config for a drive's sync: upload sessions,
+    /// selective sync rules, filters of the previous pass.
+    fn configure(&self, t: &mut Target) {
+        t.opts.upload_sessions = Some(self.upload_sessions());
+        t.opts.sync_list_file = Some(config::sync_list_path(&self.config_dir, &t.name));
+        t.opts.filter_state = Some(self.config_dir.join("filters"));
+    }
 }
 
 fn default_sync_dir() -> Result<PathBuf> {
@@ -298,7 +305,7 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
             let (mut targets, mode) = args.resolve(&cfg)?;
             for t in &mut targets {
                 t.opts.dry_run = dry_run;
-                t.opts.upload_sessions = Some(paths.upload_sessions());
+                paths.configure(t);
             }
             sync(&paths, auth, targets, mode).await
         }
@@ -318,7 +325,7 @@ async fn run(command: Command, paths: Paths, cfg: config::Config, auth: AuthConf
         Command::Daemon { args, interval } => {
             let (mut targets, mode) = args.resolve(&cfg)?;
             for t in &mut targets {
-                t.opts.upload_sessions = Some(paths.upload_sessions());
+                paths.configure(t);
             }
             let interval = Duration::from_secs(interval.or(cfg.monitor_interval).unwrap_or(300));
             daemon::run(&paths, auth, cfg.clone(), targets, mode, interval).await

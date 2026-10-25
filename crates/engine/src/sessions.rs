@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::convert::parse_graph_time;
+use crate::local::fnv1a;
 
 /// A session this close to its expiry is not worth resuming.
 const EXPIRY_MARGIN_SECS: i64 = 60;
@@ -104,11 +105,6 @@ pub(crate) fn prune(dir: &Path) {
             let _ = std::fs::remove_file(&path);
         }
     }
-}
-
-/// Stable across runs and Rust versions (unlike `DefaultHasher`).
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 #[cfg(test)]

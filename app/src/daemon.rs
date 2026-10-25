@@ -558,13 +558,17 @@ impl DriveManager for Manager {
         let current = configured(&drives.targets);
         let main_dir = drives.targets.first().map(|t| t.opts.sync_dir.clone()).unwrap_or_default();
         config::validate_new_drive(&current, &main_dir, &name, &drive_id, &sync_dir).map_err(|e| e.to_string())?;
-        let d = DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone() };
+        let d = DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone(), ..Default::default() };
         config::append_drive_section(&self.config_path, &d).map_err(|e| e.to_string())?;
-        let mut opts = self.cfg.sync_options(sync_dir);
+        let mut opts = self.cfg.sync_options(sync_dir, Some(&d));
         opts.drive_id = Some(drive_id);
         if let Some(main) = drives.targets.first() {
             opts.max_transfers = main.opts.max_transfers;
             opts.upload_sessions = main.opts.upload_sessions.clone();
+            opts.filter_state = main.opts.filter_state.clone();
+        }
+        if let Some(dir) = self.config_path.parent() {
+            opts.sync_list_file = Some(config::sync_list_path(dir, &name));
         }
         drives.targets.push(Target { name: name.clone(), opts });
         drives.version += 1;
@@ -627,7 +631,8 @@ fn configured(targets: &[Target]) -> Config {
         drives: targets
             .iter()
             .filter_map(|t| {
-                Some(DriveConfig { name: t.name.clone(), drive_id: t.opts.drive_id.clone()?, sync_dir: t.opts.sync_dir.clone() })
+                let (name, drive_id, sync_dir) = (t.name.clone(), t.opts.drive_id.clone()?, t.opts.sync_dir.clone());
+                Some(DriveConfig { name, drive_id, sync_dir, ..Default::default() })
             })
             .collect(),
         ..Default::default()
