@@ -5,6 +5,7 @@
 pub mod auth;
 mod client;
 mod error;
+pub mod realtime;
 mod upload;
 pub mod types;
 

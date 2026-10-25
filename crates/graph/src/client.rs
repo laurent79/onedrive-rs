@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::types::{DELTA_SELECT, DeltaPage, Drive, DriveItem, DriveListing, Page, SiteResource};
 
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
-const USER_AGENT: &str = concat!("ISV|onedrive-rs|onedrive-rs/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("ISV|onedrive-rs|onedrive-rs/", env!("CARGO_PKG_VERSION"));
 pub(crate) const MAX_ATTEMPTS: u32 = 8;
 /// Throttling (429/503) is retried for this long before giving up.
 const MAX_THROTTLED: Duration = Duration::from_secs(3600);

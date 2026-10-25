@@ -26,6 +26,10 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 const OFFLINE_RETRY: Duration = Duration::from_secs(60);
 /// Quiet time after a local change before starting a pass.
 const DEBOUNCE: Duration = Duration::from_secs(5);
+/// Quiet time after an online change notification: they come in bursts.
+const REMOTE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Retry delay to find the main drive's id for its notifications (offline at start).
+const DRIVE_ID_RETRY: Duration = Duration::from_secs(60);
 
 /// Drive list shared between the sync loop and D-Bus drive management.
 pub(crate) struct Drives {
@@ -54,6 +58,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
     };
     let drives = Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), resync: Vec::new(), version: 0 }));
     let verifier = Verifier::new(paths.db(), paths.config_dir.join("verify.json"), drives.clone());
+    let realtime = cfg.disable_websocket_support != Some(true);
     let manager = Arc::new(Manager {
         graph: graph.clone(),
         config_path: paths.config(),
@@ -75,6 +80,9 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
 
     let mut statuses: Vec<DriveStatus> = Vec::new();
     let mut watchers: Vec<odrs_watch::Watcher> = Vec::new();
+    // Online change notifications, one listener per drive.
+    let mut listeners: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
     let mut watched_version = None;
     let (local_tx, local_rx) = mpsc::unbounded_channel();
     let mut local_rx = (mode == SyncMode::Bidirectional).then_some(local_rx);
@@ -123,6 +131,12 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
                     }
                 }
             }
+            if realtime {
+                for l in listeners.drain(..) {
+                    l.abort();
+                }
+                listeners = targets.iter().map(|t| spawn_listener(graph.clone(), t, remote_tx.clone())).collect();
+            }
             statuses = targets.iter().map(|t| status_for(t, &statuses)).collect();
             server.set_drives(statuses.clone()).await?;
             watched_version = Some(version);
@@ -135,6 +149,17 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             Some(path) = local_change(&mut local_rx) => {
                 tracing::debug!(path = %path.display(), "local change");
                 next = next.min(Instant::now() + DEBOUNCE);
+                continue;
+            }
+            Some((drive, signal)) = remote_rx.recv() => {
+                match signal {
+                    odrs_graph::realtime::Signal::Changed => {
+                        tracing::info!(drive, "online change notified");
+                        next = next.min(Instant::now() + REMOTE_DEBOUNCE);
+                    }
+                    odrs_graph::realtime::Signal::Connected => tracing::info!(drive, "online changes now notified in near real time"),
+                    odrs_graph::realtime::Signal::Disconnected => tracing::debug!(drive, "online change notifications interrupted"),
+                }
                 continue;
             }
             cmd = rx.recv() => {
@@ -233,6 +258,43 @@ pub(crate) fn reset_drive(store: &Store, targets: &[Target], name: &str) {
         Ok(None) => tracing::info!(drive = name, "resync: nothing recorded yet"),
         Err(e) => tracing::error!(drive = name, error = %e, "resync failed"),
     }
+}
+
+/// Forward a drive's online change notifications, tagged with its name. The
+/// main drive's id is not in the config: ask Graph (retried while offline).
+fn spawn_listener(
+    graph: Arc<Graph>,
+    t: &Target,
+    out: mpsc::UnboundedSender<(String, odrs_graph::realtime::Signal)>,
+) -> tokio::task::JoinHandle<()> {
+    let (name, drive_id) = (t.name.clone(), t.opts.drive_id.clone());
+    tokio::spawn(async move {
+        let drive_id = match drive_id {
+            Some(id) => id,
+            None => loop {
+                match graph.me_drive().await {
+                    Ok(d) => break d.id,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "main drive id unknown; realtime notifications retried later");
+                        tokio::time::sleep(DRIVE_ID_RETRY).await;
+                    }
+                }
+            },
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let listener = odrs_graph::realtime::listen(graph, drive_id, tx);
+        tokio::pin!(listener);
+        loop {
+            tokio::select! {
+                () = &mut listener => return,
+                Some(signal) = rx.recv() => {
+                    if out.send((name.clone(), signal)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Keep what is known about a drive across drive list changes.

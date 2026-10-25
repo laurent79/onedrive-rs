@@ -57,6 +57,12 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
 - Filtres (deux sens) : `skip_file` (défaut `~*|.~*|*.tmp|*.swp|*.partial`, les entrées utilisateur
   s'ajoutent), `skip_dir` (nom partout / chemin exact), `skip_dotfiles`, noms refusés par OneDrive.
 - Permissions : dossiers 0700, fichiers 0600 (défauts D).
+- Changements en ligne quasi instantanés (`odrs_graph::realtime`, comme `socketio.d` de D) : par drive,
+  `GET /drives/{id}/root/subscriptions/socketIo` → `notificationUrl`, WebSocket Socket.IO v4 (`40`, `40/notifications`,
+  pong `3`), événement `notification` = « lancer /delta » → passe 2 s après la dernière. URL renouvelée 120 s avant
+  expiration, reconnexion 1→60 s, silence > pingInterval+pingTimeout = connexion morte. TLS = même pile que reqwest
+  (rustls + aws-lc-rs + vérificateur plateforme), `tokio-tungstenite` sans TLS. `disable_websocket_support` (option D).
+  Le RSS inclut ~16 Mo pour les 4 connexions (58 Mo mesuré) ; `MemoryPeak` systemd compte aussi le cache disque.
 - Daemon : intervalle 300 s ; inotify (bidirectionnel) → passe 5 s après le dernier changement ; hors ligne →
   nouvelle passe après 60 s ; login expiré → `LastError` préfixé `AUTH_ERROR_PREFIX` (bouton GUI).
 - Resync d'un drive (`--resync` de D ; CLI `resync --drive`, D-Bus `Resync`, icône GUI avec confirmation) :
@@ -131,8 +137,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : changements en ligne quasi
-  instantanés (webhooks/WebSocket), sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
+- À faire : sync sélective (`sync_list`), éléments partagés (`remote`), reprise des
   uploads en session après redémarrage, progression des envois, application Entra dédiée, paquet RPM.
 
 ## Conventions

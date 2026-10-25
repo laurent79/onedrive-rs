@@ -27,6 +27,8 @@ pub struct Config {
     pub skip_dir: Option<String>,
     pub skip_dotfiles: Option<bool>,
     pub classify_as_big_delete: Option<u64>,
+    /// No near-real-time notifications of online changes (D's option name).
+    pub disable_websocket_support: Option<bool>,
     pub sync_dir_permissions: Option<u32>,
     pub sync_file_permissions: Option<u32>,
     /// Only in a D client configuration dedicated to one SharePoint library.
@@ -106,6 +108,7 @@ impl Config {
                 "skip_dir" => append(&mut c.skip_dir, value),
                 "skip_dotfiles" => c.skip_dotfiles = Some(boolean(value, line_no)?),
                 "classify_as_big_delete" => c.classify_as_big_delete = Some(number(value, line_no)?),
+                "disable_websocket_support" => c.disable_websocket_support = Some(boolean(value, line_no)?),
                 // Octal digits written as a decimal number, as in the D client ("700").
                 "sync_dir_permissions" => c.sync_dir_permissions = Some(octal(value, line_no)?),
                 "sync_file_permissions" => c.sync_file_permissions = Some(octal(value, line_no)?),
