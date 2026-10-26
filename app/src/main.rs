@@ -12,6 +12,7 @@ use odrs_store::Store;
 mod config;
 mod daemon;
 mod import;
+mod trash;
 mod verifier;
 mod verify;
 

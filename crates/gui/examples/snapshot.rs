@@ -8,7 +8,9 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use odrs_gui::{ActivityRow, ActivityWindow, DriveRow, FolderRow, FoldersWindow, MainWindow, ReportWindow, ResyncWindow, Status};
+use odrs_gui::{
+    ActivityRow, ActivityWindow, DriveRow, FolderRow, FoldersWindow, MainWindow, ProblemRow, ProblemsWindow, ReportWindow, ResyncWindow, Status,
+};
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
 fn snapshot(window: &slint::Window, out: String) {
@@ -41,6 +43,34 @@ fn main() {
                     .map(StandardListViewItem::from)
                     .collect();
             w.set_items(ModelRc::from(Rc::new(VecModel::from(items))));
+            w.show().unwrap();
+            let weak = w.as_weak();
+            slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
+            slint::run_event_loop().unwrap();
+        }
+        "problems" => {
+            let w = ProblemsWindow::new().unwrap();
+            w.set_drive_title("Sales".into());
+            let conflict = |name: &str, backup: &str| ProblemRow {
+                kind: "conflict".into(),
+                name: name.into(),
+                detail: backup.into(),
+                path: format!("/home/u/Sales/{name}").into(),
+                backup: format!("/home/u/Sales/{backup}").into(),
+            };
+            let rows = vec![
+                conflict("offer.docx", "offer-pc-safeBackup-0001.docx"),
+                conflict("prices.xlsx", "prices-pc-safeBackup-0002.xlsx"),
+                ProblemRow {
+                    kind: "error".into(),
+                    name: "locked.pdf".into(),
+                    detail: "I/O error: Permission denied (os error 13)".into(),
+                    path: "/home/u/Sales/locked.pdf".into(),
+                    backup: "".into(),
+                },
+            ];
+            w.set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+            w.set_current(0);
             w.show().unwrap();
             let weak = w.as_weak();
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
@@ -125,6 +155,8 @@ fn main() {
                     verify_state: "done".into(),
                     verify_problems: 2,
                     verify_mins: 90,
+                    conflicts: 2,
+                    failures: 1,
                     show_upload: true,
                     upload_fraction: 0.35,
                     upload_done: 1,
@@ -143,6 +175,6 @@ fn main() {
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
             slint::run_event_loop().unwrap();
         }
-        other => panic!("unknown window {other:?} (main, resync, report, folders, activity)"),
+        other => panic!("unknown window {other:?} (main, resync, report, folders, activity, problems)"),
     }
 }

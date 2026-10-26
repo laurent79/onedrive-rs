@@ -83,6 +83,26 @@ pub struct DriveStatus {
     pub last_error: String,
     /// Counters of its current or last pass.
     pub progress: Progress,
+    /// Items its last pass could not sync (at most 50).
+    pub failures: Vec<ItemFailure>,
+    /// safeBackup copies still present: files changed on both sides.
+    pub conflicts: Vec<Conflict>,
+}
+
+/// An item a pass could not sync.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
+pub struct ItemFailure {
+    /// Absolute local path, or the online name when it has no local place yet.
+    pub path: String,
+    pub message: String,
+}
+
+/// A file changed on both sides: the online version is at `path`, the local
+/// one was kept aside as `backup` (absolute paths).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type, Value, OwnedValue)]
+pub struct Conflict {
+    pub path: String,
+    pub backup: String,
 }
 
 /// Integrity check of one drive, in the `Verifications` property.
@@ -214,6 +234,10 @@ pub trait DriveManager: Send + Sync + 'static {
     /// sync). `delete_local`: also delete the local copies of what is no longer
     /// synced (unchanged files only); otherwise they are kept.
     fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> std::result::Result<(), String>;
+    /// Settle a conflict of a drive: keep the local version (`backup` replaces
+    /// the file) or the online one (`backup` goes). The version set aside goes
+    /// to the desktop trash.
+    fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> std::result::Result<(), String>;
 }
 
 /// Commands sent by clients to the daemon loop.
@@ -313,6 +337,12 @@ impl Service {
 
     async fn custom_rules(&self, name: String) -> zbus::fdo::Result<Vec<String>> {
         self.manager.custom_rules(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// Settle a conflict (see [`DriveManager::resolve_conflict`]); a pass starts now.
+    async fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> zbus::fdo::Result<()> {
+        self.manager.resolve_conflict(name, backup, keep_local).map_err(zbus::fdo::Error::Failed)?;
+        self.send(Command::SyncNow)
     }
 
     /// Change which folders of a drive are synced; applied by a pass that starts now.
@@ -494,6 +524,7 @@ pub trait OneDrive {
     fn list_folders(&self, name: &str, path: &str) -> zbus::Result<Vec<Folder>>;
     fn custom_rules(&self, name: &str) -> zbus::Result<Vec<String>>;
     fn set_selection(&self, name: &str, choices: &[FolderChoice], delete_local: bool) -> zbus::Result<()>;
+    fn resolve_conflict(&self, name: &str, backup: &str, keep_local: bool) -> zbus::Result<()>;
     #[zbus(property)]
     fn verifications(&self) -> zbus::Result<Vec<VerifyStatus>>;
     #[zbus(property)]

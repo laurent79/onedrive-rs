@@ -62,6 +62,7 @@ enum UiCommand {
     ListFolders { drive: String, path: String },
     CustomRules(String),
     SetSelection { drive: String, choices: Vec<FolderChoice>, delete_local: bool },
+    ResolveConflict { drive: String, backup: String, keep_local: bool },
 }
 
 /// Run the UI on the current thread until the user quits from the tray menu.
@@ -120,8 +121,14 @@ struct Ui {
     resync: Option<ResyncWindow>,
     folders: Option<FoldersWindow>,
     activity: Option<ActivityWindow>,
+    problems: Option<ProblemsWindow>,
     /// Latest daemon state, for a main window opened later.
     status: Status,
+    /// Latest drive statuses, for the "to resolve" window.
+    drive_statuses: Vec<DriveStatus>,
+    /// Conflicts settled from that window (their safeBackup paths), hidden
+    /// until the daemon's next pass of the drive no longer lists them.
+    resolved: std::collections::HashSet<String>,
     /// Latest daemon events, oldest first, for the activity window.
     events: Vec<Event>,
     /// Updated in place, so rows (and their pending "confirm removal") survive refreshes.
@@ -258,6 +265,80 @@ fn activity_window() -> Option<ActivityWindow> {
     )
 }
 
+fn problems_window() -> Option<ProblemsWindow> {
+    lazy(
+        |u| &mut u.problems,
+        |ctx| {
+            let w = ProblemsWindow::new()?;
+            w.set_rows(ModelRc::from(Rc::new(VecModel::<ProblemRow>::default())));
+            let (p, t) = (w.as_weak(), ctx.tx.clone());
+            w.on_keep(move |i, keep_local| {
+                let Some(p) = p.upgrade() else { return };
+                let Some(row) = usize::try_from(i).ok().and_then(|i| p.get_rows().row_data(i)) else { return };
+                p.set_busy(true);
+                p.set_message(SharedString::new());
+                let drive = p.get_drive_name().into();
+                let _ = t.send(UiCommand::ResolveConflict { drive, backup: row.backup.into(), keep_local });
+            });
+            let (p, rt) = (w.as_weak(), ctx.rt.clone());
+            w.on_show_item(move |i| {
+                let Some(p) = p.upgrade() else { return };
+                if let Some(row) = usize::try_from(i).ok().and_then(|i| p.get_rows().row_data(i)) {
+                    // A conflict's copy sits next to the file: show it, the file is beside it.
+                    let path = if row.backup.is_empty() { row.path } else { row.backup };
+                    rt.spawn(show_in_folder(path.into()));
+                }
+            });
+            let t = ctx.tx.clone();
+            w.on_retry(move || {
+                let _ = t.send(UiCommand::SyncNow);
+            });
+            let p = w.as_weak();
+            w.on_dismiss(move || {
+                if let Some(p) = p.upgrade() {
+                    let _ = p.hide();
+                }
+            });
+            Ok(w)
+        },
+    )
+}
+
+/// Show the conflicts, then the failed items, of the window's drive.
+fn refresh_problems(w: &ProblemsWindow) {
+    let drive = w.get_drive_name();
+    let file_name = |p: &str| std::path::Path::new(p).file_name().map_or(p.to_owned(), |n| n.to_string_lossy().into_owned());
+    let rows: Vec<ProblemRow> = UI.with(|u| {
+        let u = u.borrow();
+        let Some(d) = u.drive_statuses.iter().find(|d| d.name == drive.as_str()) else { return Vec::new() };
+        let conflicts = d.conflicts.iter().filter(|c| !u.resolved.contains(&c.backup)).map(|c| ProblemRow {
+            kind: "conflict".into(),
+            name: file_name(&c.path).into(),
+            detail: file_name(&c.backup).into(),
+            path: c.path.as_str().into(),
+            backup: c.backup.as_str().into(),
+        });
+        let failures = d.failures.iter().map(|f| ProblemRow {
+            kind: "error".into(),
+            name: file_name(&f.path).into(),
+            detail: f.message.as_str().into(),
+            path: f.path.as_str().into(),
+            backup: SharedString::new(),
+        });
+        conflicts.chain(failures).collect()
+    });
+    let model = w.get_rows();
+    if let Some(model) = model.as_any().downcast_ref::<VecModel<ProblemRow>>()
+        && model.iter().ne(rows.iter().cloned())
+    {
+        let selected = usize::try_from(w.get_current()).ok().and_then(|i| model.row_data(i));
+        model.set_vec(rows);
+        // Keep the selection on the same line if it is still there.
+        let current = selected.and_then(|s| model.iter().position(|r| r == s)).map_or(-1, |i| i32::try_from(i).unwrap_or(-1));
+        w.set_current(current);
+    }
+}
+
 /// Show the latest events in the activity window, newest first (only if they
 /// changed, so that the selection stays).
 fn refresh_activity(w: &ActivityWindow) {
@@ -343,6 +424,18 @@ fn wire_logic(logic: &Logic<'_>, ctx: &Rc<Ctx>) {
             });
         }
         Err(e) => tracing::error!(error = %e, "could not start the login"),
+    });
+    logic.on_show_problems(|name| {
+        if let Some(w) = problems_window() {
+            UI.with(|u| u.borrow_mut().resolved.clear());
+            w.set_drive_title(drive_title(&name).into());
+            w.set_drive_name(name);
+            w.set_current(-1);
+            w.set_busy(false);
+            w.set_message(SharedString::new());
+            refresh_problems(&w);
+            let _ = w.show();
+        }
     });
     logic.on_show_activity(|| {
         if let Some(w) = activity_window() {
@@ -667,18 +760,27 @@ async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>) {
         }
         // Kept while the daemon is stopped.
         let events = snapshot.as_ref().map(|s| s.events.clone());
+        let drive_statuses = snapshot.as_ref().map(|s| s.drives.clone());
         last = snapshot;
         let _ = slint::invoke_from_event_loop(move || {
-            let (main, drives, activity) = UI.with(|u| {
+            let (main, drives, activity, problems) = UI.with(|u| {
                 let mut u = u.borrow_mut();
                 u.status = status.clone();
                 if let Some(events) = events {
                     u.events = events;
                 }
+                if let Some(drives) = drive_statuses {
+                    u.drive_statuses = drives;
+                }
                 if let Some(t) = u.tray.as_ref().filter(|t| t.get_status() != status) {
                     t.set_status(status.clone());
                 }
-                (u.main.as_ref().map(MainWindow::clone_strong), u.drives.clone(), u.activity.as_ref().map(ActivityWindow::clone_strong))
+                (
+                    u.main.as_ref().map(MainWindow::clone_strong),
+                    u.drives.clone(),
+                    u.activity.as_ref().map(ActivityWindow::clone_strong),
+                    u.problems.as_ref().map(ProblemsWindow::clone_strong),
+                )
             });
             sync_rows(&drives, rows);
             if let Some(w) = main.filter(|w| w.get_status() != status) {
@@ -686,6 +788,9 @@ async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>) {
             }
             if let Some(w) = activity.filter(|w| w.window().is_visible()) {
                 refresh_activity(&w);
+            }
+            if let Some(w) = problems.filter(|w| w.window().is_visible()) {
+                refresh_problems(&w);
             }
         });
     }
@@ -759,6 +864,10 @@ fn existing_add() -> Option<AddLibraryWindow> {
     existing(|u| &u.add)
 }
 
+fn existing_problems() -> Option<ProblemsWindow> {
+    existing(|u| &u.problems)
+}
+
 fn existing_folders() -> Option<FoldersWindow> {
     existing(|u| &u.folders)
 }
@@ -810,6 +919,19 @@ async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>) {
                     }
                 });
                 refresh_folders(&f);
+            });
+        }
+        UiCommand::ResolveConflict { drive, backup, keep_local } => {
+            let result = d.resolve_conflict(&drive, &backup, keep_local).await;
+            in_ui(existing_problems, move |w| {
+                w.set_busy(false);
+                match result {
+                    Ok(()) => {
+                        UI.with(|u| u.borrow_mut().resolved.insert(backup));
+                        refresh_problems(&w);
+                    }
+                    Err(e) => w.set_message(daemon_message(&e).into()),
+                }
             });
         }
         UiCommand::CustomRules(drive) => {
@@ -1019,6 +1141,8 @@ fn to_row(d: &DriveStatus, (rate, upload_rate): (Option<f64>, Option<f64>), v: O
         verify_problems: v.map_or(0, |v| int(v.problems())),
         verify_mins: v.and_then(|v| minutes_since(&v.finished)).unwrap_or(-1),
         verify_message: v.map_or("", |v| v.message.as_str()).into(),
+        conflicts: int(d.conflicts.len() as u64),
+        failures: int(d.failures.len() as u64),
     }
 }
 

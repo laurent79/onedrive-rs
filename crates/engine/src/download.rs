@@ -115,8 +115,9 @@ impl<'a> DownloadSync<'a> {
                     if e.is_fatal() {
                         return Err(e);
                     }
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(id = %item.id, name = item.name.as_deref().unwrap_or(""), error = %e, "failed to apply item");
+                    let place = self.item_place(item);
+                    self.stats.record_failure(place, &e);
                 }
             }
             self.reap_ready()?;
@@ -137,6 +138,16 @@ impl<'a> DownloadSync<'a> {
         }
         self.store.commit()?;
         Ok(root_drive)
+    }
+
+    /// Where an online item goes locally (its name alone if its folder is unknown).
+    fn item_place(&self, item: &DriveItem) -> PathBuf {
+        let name = item.name.clone().unwrap_or_else(|| item.id.clone());
+        let drive_id = item.parent_drive_id().unwrap_or(&self.drive_id);
+        match item.parent_id().and_then(|p| self.store.path_of(drive_id, p).ok().flatten()) {
+            Some(parent) => self.local_path(&parent).join(name),
+            None => PathBuf::from(name),
+        }
     }
 
     fn local_path(&self, rel: &str) -> PathBuf {
@@ -382,8 +393,8 @@ impl<'a> DownloadSync<'a> {
             }
             Err(e) if e.is_fatal() => Err(e),
             Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(path = %outcome.path.display(), error = %e, "download failed");
+                self.stats.record_failure(outcome.path.clone(), &e);
                 Ok(())
             }
         }

@@ -111,6 +111,12 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   50 par passe au plus, le reste compté → événement `more`) ; le daemon les publie toutes les 2 s pendant la passe
   dans `Events` (avec conflits et fin de synchro complète), garde les 100 derniers dans `<config>/events.json`
   (0600, rechargé au démarrage). GUI : fenêtre « Activité récente » (bouton « Activité », menu de l'icône).
+- Conflits et échecs (`DriveStatus::conflicts`/`failures`, recalculés après chaque passe d'un drive) : conflits = copies
+  `-safeBackup-` encore présentes (lignes DB `Store::files_named_like` + celles de la passe), original retrouvé par
+  `local::backup_original` ; échecs = `Stats::failures` (50 max, chemin + message). D-Bus `ResolveConflict(drive,
+  backup, keep_local)` : garder la version locale (la copie remplace le fichier, envoyée ensuite) ou en ligne (la copie
+  part) ; la version écartée va dans la corbeille du bureau (`app/src/trash.rs`, spécification freedesktop, jamais
+  supprimée). GUI : ligne « N conflits à résoudre » + « Résoudre… » sur la carte → fenêtre « À résoudre ».
 - Vérification d'intégrité (`odrs_engine::verify`, CLI `verify` et D-Bus `Verify`/`CancelVerify`/`VerifyReport`,
   propriété `Verifications`) : lecture seule, un drive à la fois à côté des passes (2 threads, connexion SQLite
   propre) ; écarts revérifiés à la fin (ligne DB changée = la synchro est passée par là → ignoré). Dernier

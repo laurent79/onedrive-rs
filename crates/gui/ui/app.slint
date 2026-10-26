@@ -60,6 +60,23 @@ export struct DriveRow {
     // Minutes since it ended, -1 if unknown.
     verify-mins: int,
     verify-message: string,
+    // safeBackup copies still present, items its last pass could not sync.
+    conflicts: int,
+    failures: int,
+}
+
+// One line of the "to resolve" window of a drive.
+export struct ProblemRow {
+    // "conflict" | "error"
+    kind: string,
+    // File name.
+    name: string,
+    // Conflict: name of the copy of the local version. Error: the message.
+    detail: string,
+    // Absolute path of the file (an online name if it has no local place).
+    path: string,
+    // Conflict: absolute path of the copy of the local version.
+    backup: string,
 }
 
 // One line of the folder chooser (a folder of the drive, at some depth).
@@ -108,6 +125,8 @@ export global Logic {
     callback choose-folders(string);
     callback add-library();
     callback show-activity();
+    // Conflicts and failed items of a drive (drive name).
+    callback show-problems(string);
     callback start-daemon();
     callback reconnect();
     callback show-window();
@@ -216,6 +235,14 @@ export global Fmt {
         return a.drive + " · " + what + " · " + when;
     }
 
+    public pure function problems-label(d: DriveRow) -> string {
+        let conflicts = @tr("{n} conflict to resolve" | "{n} conflicts to resolve" % d.conflicts);
+        let failures = @tr("{n} item not synchronised" | "{n} items not synchronised" % d.failures);
+        if d.conflicts > 0 && d.failures > 0 { return conflicts + " · " + failures; }
+        if d.conflicts > 0 { return conflicts; }
+        return failures;
+    }
+
     public pure function upload-label(d: DriveRow) -> string {
         let files = @tr("Uploading {n} file" | "Uploading {n} files" % d.upload-files);
         let amount = @tr("{} of {} MB", round(d.upload-sent-mb), round(d.upload-total-mb));
@@ -302,6 +329,21 @@ component DriveView inherits Rectangle {
                 if drive.verify-state == "done" && drive.verify-problems > 0: Button {
                     text: @tr("Details…");
                     clicked => { Logic.show-report(drive.name); }
+                }
+            }
+            if drive.conflicts > 0 || drive.failures > 0: HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: Fmt.problems-label(drive);
+                    font-size: 11px;
+                    color: #e65100;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: @tr("Resolve…");
+                    clicked => { Logic.show-problems(drive.name); }
                 }
             }
             if drive.verify-state == "running": ProgressIndicator { progress: drive.verify-fraction; height: 4px; }
@@ -790,6 +832,118 @@ export component FoldersWindow inherits Window {
                 primary: true;
                 enabled: !root.loading && !root.saving && !root.nothing-selected;
                 clicked => { root.save(); }
+            }
+        }
+    }
+}
+
+// Conflicts (files changed on both sides) and items that failed, of one drive.
+export component ProblemsWindow inherits Window {
+    in property <string> drive-name;
+    in property <string> drive-title;
+    in property <[ProblemRow]> rows;
+    in property <bool> busy;
+    in property <string> message;
+    in-out property <int> current: -1;
+    // Conflict: keep the local version (true) or the online one.
+    callback keep(int, bool);
+    callback show-item(int);
+    callback retry();
+    callback dismiss();
+
+    title: @tr("To resolve — {}", root.drive-title);
+    icon: @image-url("../icons/app.png");
+    preferred-width: 640px;
+    preferred-height: 520px;
+    min-width: 460px;
+    min-height: 420px;
+
+    VerticalBox {
+        Text {
+            text: @tr("A conflict is a file changed both here and online: the online version is in its place, yours was kept next to it. Choose the one to keep; the other goes to the trash (and to the OneDrive recycle bin).");
+            wrap: word-wrap;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-radius: 4px;
+            border-color: Palette.border;
+            ListView {
+                for row[i] in root.rows: Rectangle {
+                    height: 44px;
+                    background: i == root.current ? Palette.selection-background : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 10px;
+                        Text {
+                            text: row.kind == "conflict" ? "⚠" : "✕";
+                            width: 18px;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            color: row.kind == "conflict" ? #e65100 : #c62828;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: row.name;
+                                overflow: elide;
+                                color: i == root.current ? Palette.selection-foreground : Palette.foreground;
+                            }
+                            Text {
+                                text: row.kind == "conflict" ? @tr("Your version: {}", row.detail) : row.detail;
+                                font-size: 11px;
+                                overflow: elide;
+                                color: (i == root.current ? Palette.selection-foreground : Palette.foreground).transparentize(30%);
+                            }
+                        }
+                    }
+                    TouchArea {
+                        clicked => { root.current = i; }
+                        double-clicked => { root.current = i; root.show-item(i); }
+                    }
+                }
+            }
+            if root.rows.length == 0: Text {
+                text: @tr("Nothing to resolve.");
+                color: Palette.foreground.transparentize(40%);
+            }
+        }
+        if root.message != "": Text {
+            text: root.message;
+            color: #c62828;
+            wrap: word-wrap;
+        }
+        HorizontalBox {
+            padding: 0;
+            property <bool> conflict: root.current >= 0 && root.rows[root.current].kind == "conflict";
+            property <bool> error: root.current >= 0 && root.rows[root.current].kind == "error";
+            if root.busy: Spinner { indeterminate: true; width: 18px; height: 18px; }
+            Button {
+                text: @tr("Keep my version");
+                enabled: conflict && !root.busy;
+                clicked => { root.keep(root.current, true); }
+            }
+            Button {
+                text: @tr("Keep the online version");
+                enabled: conflict && !root.busy;
+                clicked => { root.keep(root.current, false); }
+            }
+            Button {
+                text: @tr("Show in folder");
+                enabled: root.current >= 0;
+                clicked => { root.show-item(root.current); }
+            }
+            if error: Button {
+                text: @tr("Retry");
+                clicked => { root.retry(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: @tr("Close");
+                primary: true;
+                clicked => { root.dismiss(); }
             }
         }
     }

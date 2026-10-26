@@ -241,6 +241,11 @@ impl DriveManager for Mock {
         Ok(if name == "main" { vec!["!*.tmp".into()] } else { Vec::new() })
     }
 
+    fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> Result<(), String> {
+        println!("conflict of {name}: {backup}, keep {}", if keep_local { "local" } else { "online" });
+        Ok(())
+    }
+
     fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> Result<(), String> {
         if !choices.iter().any(|c| c.included) {
             return Err("no folder is selected".into());

@@ -344,3 +344,37 @@ msgstr "Activité récente"
 
 msgid "Nothing synchronised recently."
 msgstr "Rien n'a été synchronisé récemment."
+
+msgid "{n} conflict to resolve"
+msgid_plural "{n} conflicts to resolve"
+msgstr[0] "{n} conflit à résoudre"
+msgstr[1] "{n} conflits à résoudre"
+
+msgid "{n} item not synchronised"
+msgid_plural "{n} items not synchronised"
+msgstr[0] "{n} élément non synchronisé"
+msgstr[1] "{n} éléments non synchronisés"
+
+msgid "Resolve…"
+msgstr "Résoudre…"
+
+msgid "To resolve — {}"
+msgstr "À résoudre — {}"
+
+msgid "A conflict is a file changed both here and online: the online version is in its place, yours was kept next to it. Choose the one to keep; the other goes to the trash (and to the OneDrive recycle bin)."
+msgstr "Un conflit est un fichier modifié à la fois ici et en ligne : la version en ligne est à sa place, la vôtre a été gardée à côté. Choisissez celle à garder ; l'autre va à la corbeille (et dans la corbeille OneDrive)."
+
+msgid "Your version: {}"
+msgstr "Votre version : {}"
+
+msgid "Nothing to resolve."
+msgstr "Rien à résoudre."
+
+msgid "Keep my version"
+msgstr "Garder ma version"
+
+msgid "Keep the online version"
+msgstr "Garder la version en ligne"
+
+msgid "Retry"
+msgstr "Réessayer"

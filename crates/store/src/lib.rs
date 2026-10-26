@@ -285,6 +285,18 @@ impl Store {
         Ok(out)
     }
 
+    /// Files of a drive whose name matches the SQL `LIKE` `pattern` (a scan: for rare lookups).
+    pub fn files_named_like(&self, drive_id: &str, pattern: &str) -> Result<Vec<Item>> {
+        let mut stmt =
+            self.conn.prepare_cached(&format!("SELECT {COLUMNS} FROM item WHERE driveId = ?1 AND type = 'file' AND name LIKE ?2"))?;
+        let mut rows = stmt.query(params![drive_id, pattern])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Item::from_row(row)?);
+        }
+        Ok(out)
+    }
+
     pub fn child_by_name(&self, drive_id: &str, parent_id: &str, name: &str) -> Result<Option<Item>> {
         let mut stmt =
             self.conn.prepare_cached(&format!("SELECT {COLUMNS} FROM item WHERE name = ?3 AND driveId = ?1 AND parentId = ?2"))?;

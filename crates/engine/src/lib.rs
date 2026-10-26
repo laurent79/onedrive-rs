@@ -162,6 +162,19 @@ pub struct Stats {
     /// caller as it goes); the others are only counted.
     pub activity: Mutex<Vec<Activity>>,
     pub activity_recorded: AtomicU64,
+    /// Items that failed during the pass (the first [`MAX_FAILURES`]).
+    pub failures: Mutex<Vec<Failure>>,
+}
+
+/// Failures kept per pass in [`Stats::failures`] (all are counted in `errors`).
+pub const MAX_FAILURES: usize = 50;
+
+/// An item the pass could not sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// Local path, or the online name when the item has no local place yet.
+    pub path: PathBuf,
+    pub message: String,
 }
 
 /// Files listed per pass in [`Stats::activity`]: a first sync is not listed file by file.
@@ -215,24 +228,18 @@ impl Stats {
         self.activity_recorded.load(Ordering::Relaxed).saturating_sub(MAX_ACTIVITY)
     }
 
+    /// Count an item that failed, and keep it for the user to see.
+    pub(crate) fn record_failure(&self, path: PathBuf, error: &dyn std::fmt::Display) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        let mut failures = self.failures.lock().unwrap();
+        if failures.len() < MAX_FAILURES {
+            failures.push(Failure { path, message: error.to_string() });
+        }
+    }
+
     pub(crate) fn record_backup(&self, path: &Path, backup: PathBuf) {
         self.conflicts.fetch_add(1, Ordering::Relaxed);
         self.backups.lock().unwrap().push(Backup { path: path.to_owned(), backup });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn activity_is_listed_up_to_a_limit() {
-        let stats = Stats::default();
-        for i in 0..MAX_ACTIVITY + 7 {
-            stats.record_activity(ActivityKind::Downloaded, PathBuf::from(format!("/d/{i}")));
-        }
-        assert_eq!(stats.activity.lock().unwrap().len() as u64, MAX_ACTIVITY);
-        assert_eq!(stats.activity_unlisted(), 7);
     }
 }
 
@@ -268,4 +275,19 @@ pub async fn sync(graph: Arc<Graph>, store: &Store, mut opts: SyncOptions, stats
         UploadSync::new(graph, store, opts, stats).run(&drive_id).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_is_listed_up_to_a_limit() {
+        let stats = Stats::default();
+        for i in 0..MAX_ACTIVITY + 7 {
+            stats.record_activity(ActivityKind::Downloaded, PathBuf::from(format!("/d/{i}")));
+        }
+        assert_eq!(stats.activity.lock().unwrap().len() as u64, MAX_ACTIVITY);
+        assert_eq!(stats.activity_unlisted(), 7);
+    }
 }

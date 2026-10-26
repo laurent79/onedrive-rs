@@ -81,6 +81,28 @@ pub fn safe_backup(path: &Path, device: &str) -> io::Result<PathBuf> {
     Err(io::Error::other(format!("no free safeBackup name for {}", path.display())))
 }
 
+/// The file a safeBackup copy was made from: `<base>-<device>-safeBackup-NNNN<ext>`
+/// → `<base><ext>`. The device is `device` when it matches (host names may
+/// contain `-`), else the last `-`-separated part (a copy made elsewhere).
+pub fn backup_original(backup: &Path, device: &str) -> Option<PathBuf> {
+    let file_name = backup.file_name()?.to_str()?;
+    let (stem, ext) = match file_name.rfind('.') {
+        Some(i) if i > 0 => file_name.split_at(i),
+        _ => (file_name, ""),
+    };
+    let marker = stem.rfind("-safeBackup-")?;
+    let number = &stem[marker + "-safeBackup-".len()..];
+    if number.len() != 4 || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let prefix = &stem[..marker];
+    let base = match prefix.strip_suffix(device).and_then(|p| p.strip_suffix('-')) {
+        Some(base) => base,
+        None => prefix.rsplit_once('-')?.0,
+    };
+    (!base.is_empty()).then(|| backup.with_file_name(format!("{base}{ext}")))
+}
+
 pub fn device_name() -> String {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -115,6 +137,11 @@ mod tests {
         let g = dir.join(".bashrc");
         std::fs::write(&g, b"x").unwrap();
         assert_eq!(safe_backup(&g, "pc").unwrap().file_name().unwrap(), ".bashrc-pc-safeBackup-0001");
+        assert_eq!(backup_original(&b3, "pc"), Some(f.clone()));
+        assert_eq!(backup_original(&dir.join("plan-my-laptop-safeBackup-0001.odt"), "my-laptop"), Some(dir.join("plan.odt")));
+        assert_eq!(backup_original(&dir.join("plan-laptop-safeBackup-0001.odt"), "pc"), Some(dir.join("plan.odt")));
+        assert_eq!(backup_original(&dir.join(".bashrc-pc-safeBackup-0001"), "pc"), Some(dir.join(".bashrc")));
+        assert_eq!(backup_original(&f, "pc"), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

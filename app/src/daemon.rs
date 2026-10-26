@@ -11,8 +11,8 @@ use anyhow::{Context as _, Result};
 use odrs_engine::{Stats, SyncMode};
 use odrs_graph::{AuthConfig, Graph};
 use odrs_ipc::{
-    AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, Library, OFFLINE_ERROR_PREFIX,
-    Progress, Server, Site, State, VerifyFinding,
+    AUTH_ERROR_PREFIX, BoxFuture, Command, Conflict, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, ItemFailure, Library,
+    OFFLINE_ERROR_PREFIX, Progress, Server, Site, State, VerifyFinding,
 };
 use odrs_store::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -218,8 +218,9 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         let shared = Arc::new(Mutex::new(statuses.clone()));
         let started = Instant::now();
         let mut sync_requested = false;
+        let library_ids = libraries(&targets);
         let outcome = tokio::select! {
-            r = run_pass(&graph, &store, selected(&targets, only.as_ref()), mode, &server, &shared, &events) => Some(r),
+            r = run_pass(&graph, &store, selected(&targets, only.as_ref()), &library_ids, mode, Outputs { server: &server, statuses: &shared, events: &events }) => Some(r),
             () = until_pause(&mut rx, &mut sync_requested) => None,
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -374,11 +375,11 @@ async fn run_pass(
     graph: &Arc<Graph>,
     store: &Store,
     targets: Vec<(usize, &Target)>,
+    libraries: &[String],
     mode: SyncMode,
-    server: &Server,
-    statuses: &Arc<Mutex<Vec<DriveStatus>>>,
-    events: &Arc<Events>,
+    out_to: Outputs<'_>,
 ) -> PassOutcome {
+    let Outputs { server, statuses, events } = out_to;
     let mut out = PassOutcome { failures: Vec::new(), total: Progress::default(), deferred: 0 };
     for (i, t) in targets {
         let stats = Arc::new(Stats::default());
@@ -414,8 +415,16 @@ async fn run_pass(
         crate::print_stats(&stats, started, &t.name);
         out.deferred += stats.deferred.load(Ordering::Relaxed);
         add(&mut out.total, &p);
+        let recent: Vec<PathBuf> = stats.backups.lock().unwrap().iter().map(|b| b.backup.clone()).collect();
+        let conflicts = conflicts(store, t, libraries, recent);
+        let failures: Vec<ItemFailure> = std::mem::take(&mut *stats.failures.lock().unwrap())
+            .into_iter()
+            .map(|f| ItemFailure { path: f.path.display().to_string(), message: f.message })
+            .collect();
         set_status(statuses, i, |s| {
             s.progress = p;
+            s.conflicts = conflicts;
+            s.failures = failures;
             match &result {
                 Ok(()) if p.errors == 0 => {
                     s.state = "idle".into();
@@ -446,6 +455,47 @@ async fn run_pass(
         }
     }
     out
+}
+
+/// Where a pass publishes what it does.
+struct Outputs<'a> {
+    server: &'a Server,
+    /// Updated live.
+    statuses: &'a Arc<Mutex<Vec<DriveStatus>>>,
+    events: &'a Arc<Events>,
+}
+
+/// Library drive ids, to tell the main drive apart in the database.
+fn libraries(targets: &[Target]) -> Vec<String> {
+    targets.iter().filter_map(|t| t.opts.drive_id.clone()).collect()
+}
+
+/// The safeBackup copies of a drive still present: recorded ones (uploaded)
+/// and those of this pass (`recent`, maybe not uploaded yet).
+fn conflicts(store: &Store, t: &Target, libraries: &[String], recent: Vec<PathBuf>) -> Vec<Conflict> {
+    let mut backups: std::collections::BTreeSet<PathBuf> = recent.into_iter().collect();
+    match crate::verify::drive_id_of(store, t, libraries) {
+        Ok(Some(drive_id)) => match store.files_named_like(&drive_id, "%-safeBackup-%") {
+            Ok(items) => {
+                for item in items {
+                    if let Ok(Some(rel)) = store.path_of(&item.drive_id, &item.id) {
+                        backups.insert(t.opts.sync_dir.join(rel));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(drive = %t.name, error = %e, "cannot list conflicts"),
+        },
+        Ok(None) => {}
+        Err(e) => tracing::warn!(drive = %t.name, error = %e, "cannot list conflicts"),
+    }
+    backups
+        .into_iter()
+        .filter(|b| b.is_file())
+        .filter_map(|b| {
+            let original = odrs_engine::local::backup_original(&b, &t.opts.device_name)?;
+            Some(Conflict { path: original.display().to_string(), backup: b.display().to_string() })
+        })
+        .collect()
 }
 
 /// What clients may want to notify about a drive's pass: each safeBackup made,
@@ -753,6 +803,27 @@ impl DriveManager for Manager {
     fn custom_rules(&self, name: String) -> std::result::Result<Vec<String>, String> {
         let t = self.target(&name)?;
         Ok(odrs_engine::filter::custom_rules(&Self::sync_list_text(&t)?))
+    }
+
+    fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> std::result::Result<(), String> {
+        let t = self.target(&name)?;
+        let backup = PathBuf::from(backup);
+        let original = odrs_engine::local::backup_original(&backup, &t.opts.device_name)
+            .filter(|_| backup.starts_with(&t.opts.sync_dir) && backup.is_file())
+            .ok_or_else(|| format!("{} is not a safeBackup copy in {}", backup.display(), t.opts.sync_dir.display()))?;
+        let trash = |p: &std::path::Path| crate::trash::trash(p).map_err(|e| format!("cannot move {} to the trash: {e}", p.display()));
+        if keep_local {
+            // The online version (in the file's place) is set aside; the next pass uploads ours over it.
+            if original.exists() {
+                trash(&original)?;
+            }
+            std::fs::rename(&backup, &original).map_err(|e| format!("{}: {e}", original.display()))?;
+        } else {
+            // Its online copy (if uploaded) is deleted by the next pass, to the OneDrive recycle bin.
+            trash(&backup)?;
+        }
+        tracing::info!(drive = %name, file = %original.display(), kept = if keep_local { "local" } else { "online" }, "conflict resolved");
+        Ok(())
     }
 
     fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> std::result::Result<(), String> {

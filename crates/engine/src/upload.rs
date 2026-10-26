@@ -94,8 +94,8 @@ impl<'a> UploadSync<'a> {
             if e.is_fatal() {
                 return Err(e);
             }
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
             tracing::error!(error = %e, "move detection failed; moves will be handled as upload + delete");
+            self.stats.record_failure(self.opts.sync_dir.clone(), &format!("move detection failed: {e}"));
         }
 
         let mut stack = vec![(root, String::new())];
@@ -108,8 +108,8 @@ impl<'a> UploadSync<'a> {
                 if e.is_fatal() {
                     return Err(e);
                 }
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(path = %rel, error = %e, "failed to process local folder");
+                self.stats.record_failure(self.local_path(&rel), &e);
             }
         }
         self.store.begin()?;
@@ -454,7 +454,11 @@ impl<'a> UploadSync<'a> {
             total += 1 + self.store.count_descendants(&item.drive_id, &item.id)?;
         }
         if total > self.opts.big_delete_threshold {
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            let message = format!(
+                "{total} items deleted locally: more than classify_as_big_delete ({}), not deleted online; check the sync folder",
+                self.opts.big_delete_threshold
+            );
+            self.stats.record_failure(self.opts.sync_dir.clone(), &message);
             tracing::error!(
                 items = total,
                 limit = self.opts.big_delete_threshold,
@@ -480,8 +484,8 @@ impl<'a> UploadSync<'a> {
                     tracing::warn!(path = %rel, "changed online since last sync: not deleting it, it will be downloaded again");
                 }
                 Err(e) => {
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(path = %rel, error = %e, "online deletion failed");
+                    self.stats.record_failure(self.local_path(&rel), &e);
                 }
             }
         }
@@ -502,8 +506,8 @@ impl<'a> UploadSync<'a> {
             }
             Err(e) if e.is_fatal() => Err(e),
             Err(e) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(path = %done.rel, error = %e, "upload failed");
+                self.stats.record_failure(self.local_path(&done.rel), &e);
                 Ok(())
             }
         }
