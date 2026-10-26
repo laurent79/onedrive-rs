@@ -191,4 +191,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Code, commentaires et documentation du dépôt en anglais ; échanges avec le mainteneur en français.
 - Erreurs : `thiserror` dans les crates, `anyhow` dans `app`. Logs : `tracing`.
+- Le dépôt n'est **pas** formaté par rustfmt (lignes jusqu'à ~130, expressions courtes sur une ligne) : ne pas lancer
+  `cargo fmt`, suivre le style environnant à la main. `cargo clippy --all-targets` doit rester propre (2 avertissements
+  connus : `chunks_exact_mut` dans quickxor, `type_complexity` de `collect_changes`).
 - Branche `main`.
