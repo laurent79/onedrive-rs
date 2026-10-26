@@ -183,9 +183,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 ## Problèmes connus / à faire
 
-- Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
-  et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : éléments partagés (`remote`), progression des envois, application Entra dédiée, paquet RPM.
+- À faire : éléments partagés (`remote`), application Entra dédiée, paquet RPM.
 
 ## Conventions
 
