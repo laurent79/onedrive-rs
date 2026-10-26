@@ -302,3 +302,11 @@ msgstr "Sélectionnez au moins un dossier."
 
 msgid "Save"
 msgstr "Enregistrer"
+
+msgid "Uploading {n} file"
+msgid_plural "Uploading {n} files"
+msgstr[0] "Envoi de {n} fichier"
+msgstr[1] "Envoi de {n} fichiers"
+
+msgid "{} of {} MB"
+msgstr "{} sur {} Mo"

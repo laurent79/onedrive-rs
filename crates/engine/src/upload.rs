@@ -419,7 +419,10 @@ impl<'a> UploadSync<'a> {
         while self.tasks.len() >= self.opts.max_transfers.max(1) {
             self.join_one().await?;
         }
+        self.stats.upload_queued.fetch_add(1, Ordering::Relaxed);
+        self.stats.upload_queued_bytes.fetch_add(size, Ordering::Relaxed);
         let graph = self.graph.clone();
+        let stats = self.stats.clone();
         let path = self.local_path(&rel);
         let device = self.opts.device_name.clone();
         let file_mode = self.opts.file_mode;
@@ -431,7 +434,11 @@ impl<'a> UploadSync<'a> {
             crate::sessions::FileSession::new(dir, &key, &path, size, mtime)
         });
         self.tasks.spawn(async move {
-            let env = UploadEnv { device: &device, file_mode, sessions: session.as_ref().map(|s| s as &dyn odrs_graph::SessionStore) };
+            let hooks = odrs_graph::UploadHooks {
+                sessions: session.as_ref().map(|s| s as &dyn odrs_graph::SessionStore),
+                sent: Some(&stats.upload_sent_bytes),
+            };
+            let env = UploadEnv { device: &device, file_mode, hooks };
             let result = upload(&graph, &target, &path, size, mtime, &env).await;
             Uploaded { rel, result }
         });
@@ -525,8 +532,8 @@ struct UploadEnv<'a> {
     /// For safeBackup names.
     device: &'a str,
     file_mode: u32,
-    /// Keeps a large upload's session to resume it after an interruption.
-    sessions: Option<&'a dyn odrs_graph::SessionStore>,
+    /// Session to resume after an interruption, progress.
+    hooks: odrs_graph::UploadHooks<'a>,
 }
 
 /// Upload one file. If it changed online since the last sync (HTTP 412), the
@@ -541,13 +548,13 @@ async fn upload(
     mtime: i64,
     env: &UploadEnv<'_>,
 ) -> Result<Outcome, Error> {
-    let UploadEnv { device, file_mode, sessions } = *env;
+    let UploadEnv { device, file_mode, hooks } = *env;
     let local_hash = crate::download::hash_file(path.to_owned()).await?;
     let mtime_str = OffsetDateTime::from_unix_timestamp(mtime).map(format_db_time).unwrap_or_default();
     let drive_id = match target {
         UploadTarget::New { drive_id, .. } | UploadTarget::Replace { drive_id, .. } => drive_id.clone(),
     };
-    let uploaded = match graph.upload_file(target, path, size, &mtime_str, sessions).await {
+    let uploaded = match graph.upload_file(target, path, size, &mtime_str, hooks).await {
         Ok(item) => item,
         Err(e) if e.status() == Some(412) => {
             let UploadTarget::Replace { item_id, .. } = target else { return Err(e.into()) };

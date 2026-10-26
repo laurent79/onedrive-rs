@@ -57,6 +57,8 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   d'enfants, fichier = taille + mtime puis hash → un seul `PATCH`.
 - Upload : simple ≤ 4 Mio, sinon session (fragments 10 Mio) ; différé si le fichier a moins de 10 s ;
   `If-Match` cTag|eTag. Après un simple upload, mtime local aligné sur celui renvoyé (comme D).
+  Progression : `Stats::upload_queued[_bytes]` (envois lancés) et `upload_sent_bytes` (octets acceptés, fragment par
+  fragment via `UploadHooks::sent`) → `Progress::upload_*` → barre « Envoi » de la GUI au-delà de 8 Mio.
 - Reprise des sessions d'upload (`SessionStore`, `crates/engine/src/sessions.rs`) : un JSON 0600 par envoi dans
   `<config>/upload_sessions/` (URL pré-authentifiée, taille, mtime, expiration), réutilisé seulement si le fichier est
   inchangé ; reprise à `nextExpectedRanges`. Avant de reprendre un remplacement, cTag/eTag en ligne revérifié (sinon la

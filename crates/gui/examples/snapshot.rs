@@ -95,9 +95,23 @@ fn main() {
                     verify_fraction: 0.47,
                     ..row("Engineering", "Engineering", "idle")
                 },
-                DriveRow { verify_state: "done".into(), verify_problems: 2, verify_mins: 90, ..row("Sales", "Sales", "syncing") },
+                DriveRow {
+                    verify_state: "done".into(),
+                    verify_problems: 2,
+                    verify_mins: 90,
+                    show_upload: true,
+                    upload_fraction: 0.35,
+                    upload_done: 1,
+                    upload_files: 3,
+                    upload_sent_mb: 105.0,
+                    upload_total_mb: 300.0,
+                    upload_rate_mbs: 4.2,
+                    ..row("Sales", "Sales", "syncing")
+                },
             ];
             w.set_drives(ModelRc::from(Rc::new(VecModel::from(rows))));
+            // Tall enough for every card.
+            w.window().set_size(slint::LogicalSize::new(560.0, 600.0));
             w.show().unwrap();
             let weak = w.as_weak();
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));

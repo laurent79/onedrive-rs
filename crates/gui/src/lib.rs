@@ -879,16 +879,22 @@ struct Rates {
 const RATE_WINDOW: Duration = Duration::from_secs(30);
 
 impl Rates {
-    /// Bytes per second for this drive, if measurable.
-    fn sample(&mut self, d: &DriveStatus) -> Option<f64> {
+    /// Download and upload bytes per second for this drive, if measurable.
+    fn sample(&mut self, d: &DriveStatus) -> (Option<f64>, Option<f64>) {
+        let syncing = d.state == "syncing";
+        let down = self.measure(d.name.clone(), d.progress.synced_bytes, syncing);
+        let up = self.measure(format!("{}\0up", d.name), d.progress.upload_sent, syncing);
+        (down, up)
+    }
+
+    fn measure(&mut self, key: String, bytes: u64, syncing: bool) -> Option<f64> {
         let now = Instant::now();
-        let q = self.samples.entry(d.name.clone()).or_default();
-        let bytes = d.progress.synced_bytes;
-        if d.state != "syncing" || q.back().is_some_and(|&(_, b)| b > bytes) {
+        let q = self.samples.entry(key).or_default();
+        if !syncing || q.back().is_some_and(|&(_, b)| b > bytes) {
             // Not syncing, or a new pass started: start measuring again.
             q.clear();
         }
-        if d.state != "syncing" {
+        if !syncing {
             return None;
         }
         q.push_back((now, bytes));
@@ -901,7 +907,10 @@ impl Rates {
     }
 }
 
-fn to_row(d: &DriveStatus, rate: Option<f64>, v: Option<&VerifyStatus>) -> DriveRow {
+/// Below this, uploads are over too quickly for a bar.
+const UPLOAD_BAR_MIN_BYTES: u64 = 8 << 20;
+
+fn to_row(d: &DriveStatus, (rate, upload_rate): (Option<f64>, Option<f64>), v: Option<&VerifyStatus>) -> DriveRow {
     let int = |v: u64| i32::try_from(v).unwrap_or(i32::MAX);
     let gb = |v: u64| (v as f64 / 1e9) as f32;
     let p = &d.progress;
@@ -919,6 +928,13 @@ fn to_row(d: &DriveStatus, rate: Option<f64>, v: Option<&VerifyStatus>) -> Drive
         total_gb: gb(p.drive_bytes),
         rate_mbs: rate.map_or(-1.0, |r| (r / 1e6) as f32),
         eta_mins: eta,
+        show_upload: d.state == "syncing" && p.upload_bytes >= UPLOAD_BAR_MIN_BYTES && p.uploaded < p.upload_files,
+        upload_fraction: if p.upload_bytes > 0 { (p.upload_sent as f64 / p.upload_bytes as f64) as f32 } else { 0.0 },
+        upload_done: int(p.uploaded),
+        upload_files: int(p.upload_files),
+        upload_sent_mb: (p.upload_sent as f64 / 1e6) as f32,
+        upload_total_mb: (p.upload_bytes as f64 / 1e6) as f32,
+        upload_rate_mbs: upload_rate.map_or(-1.0, |r| (r / 1e6) as f32),
         title: drive_title(&d.name).into(),
         removable: d.name != "main",
         name: d.name.as_str().into(),

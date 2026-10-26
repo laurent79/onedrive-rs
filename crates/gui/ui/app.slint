@@ -38,6 +38,17 @@ export struct DriveRow {
     rate-mbs: float,
     // Estimated minutes left, -1 if unknown.
     eta-mins: int,
+    // Uploads of the current pass, while some are large enough to be worth a bar.
+    show-upload: bool,
+    // 0..1
+    upload-fraction: float,
+    // Files finished, files started.
+    upload-done: int,
+    upload-files: int,
+    upload-sent-mb: float,
+    upload-total-mb: float,
+    // Upload rate over the last seconds, -1 if unknown.
+    upload-rate-mbs: float,
     // Integrity check: "" (never) | "queued" | "running" | "done" | "cancelled" | "failed"
     verify-state: string,
     verify-done: int,
@@ -159,6 +170,13 @@ export global Fmt {
         return amount + " · " + rate + " · " + self.eta-label(d.eta-mins);
     }
 
+    public pure function upload-label(d: DriveRow) -> string {
+        let files = @tr("Uploading {n} file" | "Uploading {n} files" % d.upload-files);
+        let amount = @tr("{} of {} MB", round(d.upload-sent-mb), round(d.upload-total-mb));
+        if d.upload-rate-mbs < 0 { return files + " · " + amount; }
+        return files + " · " + amount + " · " + @tr("{} MB/s", round(d.upload-rate-mbs * 10) / 10);
+    }
+
     public pure function verify-label(d: DriveRow) -> string {
         if d.verify-state == "queued" { return @tr("Integrity check waiting"); }
         if d.verify-state == "running" {
@@ -247,6 +265,17 @@ component DriveView inherits Rectangle {
                 ProgressIndicator { progress: drive.fraction; height: 6px; }
                 Text {
                     text: Fmt.progress-label(drive);
+                    font-size: 11px;
+                    color: Palette.alternate-foreground.transparentize(20%);
+                    overflow: elide;
+                }
+            }
+            if drive.show-upload: VerticalLayout {
+                spacing: 2px;
+                padding-top: 4px;
+                ProgressIndicator { progress: drive.upload-fraction; height: 6px; }
+                Text {
+                    text: Fmt.upload-label(drive);
                     font-size: 11px;
                     color: Palette.alternate-foreground.transparentize(20%);
                     overflow: elide;

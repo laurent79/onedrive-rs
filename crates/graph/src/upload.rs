@@ -6,6 +6,7 @@
 //! [`SessionStore`] continues where it stopped after an interruption.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::{Method, StatusCode, header};
@@ -132,25 +133,20 @@ impl Graph {
     }
 
     /// Upload `path` (`size` bytes, last modified `mtime` RFC 3339) to `target`.
-    /// Above [`SIMPLE_UPLOAD_MAX`], `sessions` (if any) keeps the session for a later resume.
-    pub async fn upload_file(
-        &self,
-        target: &UploadTarget,
-        path: &Path,
-        size: u64,
-        mtime: &str,
-        sessions: Option<&dyn SessionStore>,
-    ) -> Result<DriveItem> {
+    pub async fn upload_file(&self, target: &UploadTarget, path: &Path, size: u64, mtime: &str, hooks: UploadHooks<'_>) -> Result<DriveItem> {
         if size <= SIMPLE_UPLOAD_MAX {
-            return self.upload_simple(target, path, size).await;
+            let item = self.upload_simple(target, path, size).await?;
+            hooks.add_sent(size);
+            return Ok(item);
         }
-        if let Some(store) = sessions
+        if let Some(store) = hooks.sessions
             && let Some(url) = store.load()
         {
             match self.resume_offset(target, &url).await? {
                 Some(offset) if offset < size => {
                     tracing::info!(path = %path.display(), offset, size, "resuming an interrupted upload");
-                    match self.upload_chunks(&url, path, size, offset).await {
+                    hooks.add_sent(offset);
+                    match self.upload_chunks(&url, path, size, offset, hooks.sent).await {
                         Ok(item) => {
                             store.clear();
                             return Ok(item);
@@ -168,7 +164,7 @@ impl Graph {
                 }
             }
         }
-        self.upload_session(target, path, size, mtime, sessions).await
+        self.upload_session(target, path, size, mtime, hooks).await
     }
 
     /// Where a saved session continues, or `None` if it cannot be used: gone on
@@ -227,8 +223,9 @@ impl Graph {
         path: &Path,
         size: u64,
         mtime: &str,
-        sessions: Option<&dyn SessionStore>,
+        hooks: UploadHooks<'_>,
     ) -> Result<DriveItem> {
+        let sessions = hooks.sessions;
         let (url, if_match, behaviour) = match target {
             UploadTarget::New { drive_id, parent_id, name } => {
                 (format!("{}/createUploadSession", child_url(drive_id, parent_id, name)), None, "fail")
@@ -256,7 +253,7 @@ impl Graph {
         if let Some(store) = sessions {
             store.save(&session.upload_url, session.expiration_date_time.as_deref());
         }
-        let result = self.upload_chunks(&session.upload_url, path, size, 0).await;
+        let result = self.upload_chunks(&session.upload_url, path, size, 0, hooks.sent).await;
         match &result {
             Ok(_) => {
                 if let Some(store) = sessions {
@@ -276,8 +273,9 @@ impl Graph {
         result
     }
 
-    /// PUT the fragments from `start` to the pre-authenticated session URL (no bearer token).
-    async fn upload_chunks(&self, upload_url: &str, path: &Path, size: u64, start: u64) -> Result<DriveItem> {
+    /// PUT the fragments from `start` to the pre-authenticated session URL (no
+    /// bearer token), adding each fragment's length to `sent` once accepted.
+    async fn upload_chunks(&self, upload_url: &str, path: &Path, size: u64, start: u64, sent: Option<&AtomicU64>) -> Result<DriveItem> {
         let mut offset = start;
         loop {
             let len = CHUNK_SIZE.min(size - offset);
@@ -324,12 +322,33 @@ impl Graph {
                 tokio::time::sleep(delay).await;
             };
             offset += len;
+            if let Some(sent) = sent {
+                sent.fetch_add(len, Ordering::Relaxed);
+            }
             if offset >= size {
                 if !matches!(resp.status(), StatusCode::OK | StatusCode::CREATED) {
                     return Err(Error::Integrity(format!("upload session ended with HTTP {}", resp.status())));
                 }
                 return Ok(serde_json::from_slice(&resp.bytes().await?)?);
             }
+        }
+    }
+}
+
+/// What an upload reports to, besides its result.
+#[derive(Clone, Copy, Default)]
+pub struct UploadHooks<'a> {
+    /// Above [`SIMPLE_UPLOAD_MAX`], keeps the session for a later resume.
+    pub sessions: Option<&'a dyn SessionStore>,
+    /// Bytes accepted by OneDrive so far (for progress), whole files below
+    /// [`SIMPLE_UPLOAD_MAX`], fragments above.
+    pub sent: Option<&'a AtomicU64>,
+}
+
+impl UploadHooks<'_> {
+    fn add_sent(&self, n: u64) {
+        if let Some(sent) = self.sent {
+            sent.fetch_add(n, Ordering::Relaxed);
         }
     }
 }

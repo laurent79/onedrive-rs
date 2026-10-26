@@ -531,6 +531,9 @@ fn progress(s: &Stats) -> Progress {
         errors: g(&s.errors),
         drive_bytes: g(&s.drive_bytes),
         synced_bytes: (g(&s.synced_bytes_at_start) + g(&s.recorded_bytes) + g(&s.bytes)).min(g(&s.drive_bytes)),
+        upload_files: g(&s.upload_queued),
+        upload_bytes: g(&s.upload_queued_bytes),
+        upload_sent: g(&s.upload_sent_bytes).min(g(&s.upload_queued_bytes)),
     }
 }
 

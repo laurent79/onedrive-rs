@@ -61,6 +61,11 @@ pub struct Progress {
     pub drive_bytes: u64,
     /// Bytes synced locally so far (at most `drive_bytes`).
     pub synced_bytes: u64,
+    /// Uploads started in this pass: files and bytes (`uploaded` counts the finished files).
+    pub upload_files: u64,
+    pub upload_bytes: u64,
+    /// Bytes of those uploads OneDrive has accepted so far.
+    pub upload_sent: u64,
 }
 
 /// State of one synchronised drive, in the `Drives` property.

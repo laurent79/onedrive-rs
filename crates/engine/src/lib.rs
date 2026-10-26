@@ -140,6 +140,11 @@ pub struct Stats {
     pub errors: AtomicU64,
     pub uploaded: AtomicU64,
     pub uploaded_bytes: AtomicU64,
+    /// Uploads started during the pass (files and bytes), and the bytes
+    /// OneDrive has accepted so far, fragments of large files included.
+    pub upload_queued: AtomicU64,
+    pub upload_queued_bytes: AtomicU64,
+    pub upload_sent_bytes: AtomicU64,
     pub folders_created_online: AtomicU64,
     pub deleted_online: AtomicU64,
     pub moved_online: AtomicU64,
