@@ -158,6 +158,42 @@ pub struct Stats {
     /// The pass started without a sync cursor and enumerated the whole drive
     /// (first sync, resync, expired cursor).
     pub full_enumeration: AtomicBool,
+    /// Files changed by the pass, at most [`MAX_ACTIVITY`] (taken by the
+    /// caller as it goes); the others are only counted.
+    pub activity: Mutex<Vec<Activity>>,
+    pub activity_recorded: AtomicU64,
+}
+
+/// Files listed per pass in [`Stats::activity`]: a first sync is not listed file by file.
+pub const MAX_ACTIVITY: u64 = 50;
+
+/// A file changed by a pass, for an activity list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// Local path.
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    Downloaded,
+    Uploaded,
+    /// Removed locally because it was deleted online.
+    Deleted,
+    /// Removed online because it was deleted locally.
+    DeletedOnline,
+}
+
+impl ActivityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Downloaded => "downloaded",
+            Self::Uploaded => "uploaded",
+            Self::Deleted => "deleted",
+            Self::DeletedOnline => "deleted-online",
+        }
+    }
 }
 
 /// A local version moved aside before it was replaced or deleted.
@@ -168,9 +204,35 @@ pub struct Backup {
 }
 
 impl Stats {
+    pub(crate) fn record_activity(&self, kind: ActivityKind, path: PathBuf) {
+        if self.activity_recorded.fetch_add(1, Ordering::Relaxed) < MAX_ACTIVITY {
+            self.activity.lock().unwrap().push(Activity { kind, path });
+        }
+    }
+
+    /// Files changed by the pass beyond those listed.
+    pub fn activity_unlisted(&self) -> u64 {
+        self.activity_recorded.load(Ordering::Relaxed).saturating_sub(MAX_ACTIVITY)
+    }
+
     pub(crate) fn record_backup(&self, path: &Path, backup: PathBuf) {
         self.conflicts.fetch_add(1, Ordering::Relaxed);
         self.backups.lock().unwrap().push(Backup { path: path.to_owned(), backup });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_is_listed_up_to_a_limit() {
+        let stats = Stats::default();
+        for i in 0..MAX_ACTIVITY + 7 {
+            stats.record_activity(ActivityKind::Downloaded, PathBuf::from(format!("/d/{i}")));
+        }
+        assert_eq!(stats.activity.lock().unwrap().len() as u64, MAX_ACTIVITY);
+        assert_eq!(stats.activity_unlisted(), 7);
     }
 }
 

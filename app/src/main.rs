@@ -423,6 +423,17 @@ async fn login(paths: &Paths, auth: AuthConfig, manual: bool) -> Result<()> {
     Ok(())
 }
 
+/// Replace `path` with `data`, readable by its owner only (written aside, then renamed).
+pub(crate) fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Exclusive lock on the config dir, so two instances never share a database.
 fn lock(paths: &Paths) -> Result<std::fs::File> {
     std::fs::create_dir_all(&paths.config_dir)?;

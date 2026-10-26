@@ -107,6 +107,10 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   (safeBackup, regroupés au-delà de 3), fin de synchro complète (`Stats::full_enumeration` : 1re synchro, resync,
   410), fin de vérification. Conflits et synchro complète passent par la propriété D-Bus `Events` (ids croissants
   même après redémarrage du daemon). Textes traduits via `Fmt.note-*` dans le Slint.
+- Activité récente : le moteur note chaque fichier téléchargé, envoyé, supprimé ici ou en ligne (`Stats::activity`,
+  50 par passe au plus, le reste compté → événement `more`) ; le daemon les publie toutes les 2 s pendant la passe
+  dans `Events` (avec conflits et fin de synchro complète), garde les 100 derniers dans `<config>/events.json`
+  (0600, rechargé au démarrage). GUI : fenêtre « Activité récente » (bouton « Activité », menu de l'icône).
 - Vérification d'intégrité (`odrs_engine::verify`, CLI `verify` et D-Bus `Verify`/`CancelVerify`/`VerifyReport`,
   propriété `Verifications`) : lecture seule, un drive à la fois à côté des passes (2 threads, connexion SQLite
   propre) ; écarts revérifiés à la fin (ligne DB changée = la synchro est passée par là → ignoré). Dernier

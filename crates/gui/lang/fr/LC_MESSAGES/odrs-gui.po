@@ -310,3 +310,37 @@ msgstr[1] "Envoi de {n} fichiers"
 
 msgid "{} of {} MB"
 msgstr "{} sur {} Mo"
+
+msgid "First synchronisation complete"
+msgstr "Première synchronisation terminée"
+
+msgid "and {n} other file"
+msgid_plural "and {n} other files"
+msgstr[0] "et {n} autre fichier"
+msgstr[1] "et {n} autres fichiers"
+
+msgctxt "activity"
+msgid "Downloaded"
+msgstr "Téléchargé"
+
+msgctxt "activity"
+msgid "Uploaded"
+msgstr "Envoyé"
+
+msgid "Deleted here (deleted online)"
+msgstr "Supprimé ici (supprimé en ligne)"
+
+msgid "Deleted online (deleted here)"
+msgstr "Supprimé en ligne (supprimé ici)"
+
+msgid "Changed on both sides: local version kept as {}"
+msgstr "Modifié des deux côtés : version locale gardée sous {}"
+
+msgid "Activity"
+msgstr "Activité"
+
+msgid "Recent activity"
+msgstr "Activité récente"
+
+msgid "Nothing synchronised recently."
+msgstr "Rien n'a été synchronisé récemment."

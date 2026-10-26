@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
-use odrs_ipc::{Client, DriveStatus, FolderChoice, Snapshot, VerifyFinding, VerifyStatus};
+use odrs_ipc::{Client, DriveStatus, Event, FolderChoice, Snapshot, VerifyFinding, VerifyStatus};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
 use tokio::sync::mpsc;
 
@@ -119,8 +119,11 @@ struct Ui {
     report: Option<ReportWindow>,
     resync: Option<ResyncWindow>,
     folders: Option<FoldersWindow>,
+    activity: Option<ActivityWindow>,
     /// Latest daemon state, for a main window opened later.
     status: Status,
+    /// Latest daemon events, oldest first, for the activity window.
+    events: Vec<Event>,
     /// Updated in place, so rows (and their pending "confirm removal") survive refreshes.
     drives: Rc<VecModel<DriveRow>>,
 }
@@ -231,6 +234,55 @@ fn folders_window() -> Option<FoldersWindow> {
     )
 }
 
+fn activity_window() -> Option<ActivityWindow> {
+    lazy(
+        |u| &mut u.activity,
+        |ctx| {
+            let w = ActivityWindow::new()?;
+            w.set_rows(ModelRc::from(Rc::new(VecModel::<ActivityRow>::default())));
+            let (a, rt) = (w.as_weak(), ctx.rt.clone());
+            w.on_show_item(move |i| {
+                let Some(a) = a.upgrade() else { return };
+                if let Some(row) = usize::try_from(i).ok().and_then(|i| a.get_rows().row_data(i)).filter(|r| !r.path.is_empty()) {
+                    rt.spawn(show_in_folder(row.path.into()));
+                }
+            });
+            let a = w.as_weak();
+            w.on_dismiss(move || {
+                if let Some(a) = a.upgrade() {
+                    let _ = a.hide();
+                }
+            });
+            Ok(w)
+        },
+    )
+}
+
+/// Show the latest events in the activity window, newest first (only if they
+/// changed, so that the selection stays).
+fn refresh_activity(w: &ActivityWindow) {
+    let rows: Vec<ActivityRow> = UI.with(|u| u.borrow().events.iter().rev().map(activity_row).collect());
+    let model = w.get_rows();
+    if let Some(model) = model.as_any().downcast_ref::<VecModel<ActivityRow>>()
+        && model.iter().ne(rows.iter().cloned())
+    {
+        model.set_vec(rows);
+    }
+}
+
+fn activity_row(e: &Event) -> ActivityRow {
+    let file_name = |p: &str| std::path::Path::new(p).file_name().map_or(p.to_owned(), |n| n.to_string_lossy().into_owned());
+    ActivityRow {
+        kind: e.kind.as_str().into(),
+        name: if e.path.is_empty() { SharedString::new() } else { file_name(&e.path).into() },
+        drive: drive_title(&e.drive).into(),
+        mins: minutes_since(&e.time).unwrap_or(0),
+        path: e.path.as_str().into(),
+        backup: if e.kind == "conflict" { file_name(&e.detail).into() } else { SharedString::new() },
+        count: if e.kind == "more" { e.detail.parse().unwrap_or(0) } else { 0 },
+    }
+}
+
 /// Run `f` on the UI thread with the window `get` returns, if any.
 fn in_ui<T: 'static>(get: fn() -> Option<T>, f: impl FnOnce(T) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
@@ -291,6 +343,13 @@ fn wire_logic(logic: &Logic<'_>, ctx: &Rc<Ctx>) {
             });
         }
         Err(e) => tracing::error!(error = %e, "could not start the login"),
+    });
+    logic.on_show_activity(|| {
+        if let Some(w) = activity_window() {
+            w.set_current(-1);
+            refresh_activity(&w);
+            let _ = w.show();
+        }
     });
     logic.on_show_window(|| {
         if let Some(w) = main_window() {
@@ -606,19 +665,27 @@ async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>) {
                 let _ = notes_tx.send(changes.iter().map(|c| to_note(&fmt, c)).collect());
             });
         }
+        // Kept while the daemon is stopped.
+        let events = snapshot.as_ref().map(|s| s.events.clone());
         last = snapshot;
         let _ = slint::invoke_from_event_loop(move || {
-            let (main, drives) = UI.with(|u| {
+            let (main, drives, activity) = UI.with(|u| {
                 let mut u = u.borrow_mut();
                 u.status = status.clone();
+                if let Some(events) = events {
+                    u.events = events;
+                }
                 if let Some(t) = u.tray.as_ref().filter(|t| t.get_status() != status) {
                     t.set_status(status.clone());
                 }
-                (u.main.as_ref().map(MainWindow::clone_strong), u.drives.clone())
+                (u.main.as_ref().map(MainWindow::clone_strong), u.drives.clone(), u.activity.as_ref().map(ActivityWindow::clone_strong))
             });
             sync_rows(&drives, rows);
             if let Some(w) = main.filter(|w| w.get_status() != status) {
                 w.set_status(status);
+            }
+            if let Some(w) = activity.filter(|w| w.window().is_visible()) {
+                refresh_activity(&w);
             }
         });
     }

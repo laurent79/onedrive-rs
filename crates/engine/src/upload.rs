@@ -27,7 +27,7 @@ use crate::decide::{LocalChange, local_change_with_hash, local_change_without_ha
 use crate::filter::is_valid_onedrive_name;
 use crate::local::{self, LocalState};
 use crate::moves::{self, Missing, NewDir, NewFile, is_within};
-use crate::{Error, Stats, SyncOptions};
+use crate::{ActivityKind, Error, Stats, SyncOptions};
 
 enum Outcome {
     Uploaded(Item, u64),
@@ -472,7 +472,10 @@ impl<'a> UploadSync<'a> {
             // Files: only if unchanged online since last sync. Folders go to the recycle bin with their content.
             let if_match = (item.item_type == ItemType::File).then(|| item.e_tag.clone()).flatten();
             match self.graph.delete_item(&item.drive_id, &item.id, if_match.as_deref()).await {
-                Ok(()) => self.store.delete(&item.drive_id, &item.id)?,
+                Ok(()) => {
+                    self.store.delete(&item.drive_id, &item.id)?;
+                    self.stats.record_activity(ActivityKind::DeletedOnline, self.local_path(&rel));
+                }
                 Err(e) if e.status() == Some(412) => {
                     tracing::warn!(path = %rel, "changed online since last sync: not deleting it, it will be downloaded again");
                 }
@@ -490,6 +493,7 @@ impl<'a> UploadSync<'a> {
             Ok(Outcome::Uploaded(item, size)) => {
                 self.stats.uploaded.fetch_add(1, Ordering::Relaxed);
                 self.stats.uploaded_bytes.fetch_add(size, Ordering::Relaxed);
+                self.stats.record_activity(ActivityKind::Uploaded, self.local_path(&done.rel));
                 Ok(self.store.upsert(&item)?)
             }
             Ok(Outcome::Conflict(item, path, backup)) => {

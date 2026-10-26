@@ -75,6 +75,24 @@ export struct FolderRow {
     loading: bool,
 }
 
+// One line of the recent activity, newest first.
+export struct ActivityRow {
+    // "downloaded" | "uploaded" | "deleted" | "deleted-online" | "conflict" | "initial-sync" | "more"
+    kind: string,
+    // File name (empty for a drive-wide event).
+    name: string,
+    // Drive title.
+    drive: string,
+    // Minutes since it happened.
+    mins: int,
+    // Absolute local path, empty if none.
+    path: string,
+    // Name of the safeBackup copy of a conflict.
+    backup: string,
+    // Files not listed ("more").
+    count: int,
+}
+
 export global Logic {
     callback sync-now();
     callback toggle-pause();
@@ -89,6 +107,7 @@ export global Logic {
     // Open the folder chooser of a drive (selective sync).
     callback choose-folders(string);
     callback add-library();
+    callback show-activity();
     callback start-daemon();
     callback reconnect();
     callback show-window();
@@ -168,6 +187,33 @@ export global Fmt {
         let rate = @tr("{} MB/s", round(d.rate-mbs * 10) / 10);
         if d.eta-mins < 0 { return amount + " · " + rate; }
         return amount + " · " + rate + " · " + self.eta-label(d.eta-mins);
+    }
+
+    public pure function activity-symbol(kind: string) -> string {
+        if kind == "downloaded" { return "↓"; }
+        if kind == "uploaded" { return "↑"; }
+        if kind == "deleted" || kind == "deleted-online" { return "✕"; }
+        if kind == "conflict" { return "⚠"; }
+        if kind == "initial-sync" { return "✓"; }
+        return "…";
+    }
+
+    public pure function activity-title(a: ActivityRow) -> string {
+        if a.kind == "initial-sync" { return @tr("First synchronisation complete"); }
+        if a.kind == "more" { return @tr("and {n} other file" | "and {n} other files" % a.count); }
+        return a.name;
+    }
+
+    public pure function activity-detail(a: ActivityRow) -> string {
+        let what = a.kind == "downloaded" ? @tr("activity" => "Downloaded")
+            : a.kind == "uploaded" ? @tr("activity" => "Uploaded")
+            : a.kind == "deleted" ? @tr("Deleted here (deleted online)")
+            : a.kind == "deleted-online" ? @tr("Deleted online (deleted here)")
+            : a.kind == "conflict" ? @tr("Changed on both sides: local version kept as {}", a.backup)
+            : "";
+        let when = self.last-sync-label(a.mins);
+        if what == "" { return a.drive + " · " + when; }
+        return a.drive + " · " + what + " · " + when;
     }
 
     public pure function upload-label(d: DriveRow) -> string {
@@ -382,6 +428,10 @@ export component MainWindow inherits Window {
             if status.state != "stopped": Button {
                 text: @tr("Add a library…");
                 clicked => { Logic.add-library(); }
+            }
+            Button {
+                text: @tr("Activity");
+                clicked => { Logic.show-activity(); }
             }
             Rectangle { horizontal-stretch: 1; }
             if status.needs-login: Button {
@@ -745,6 +795,87 @@ export component FoldersWindow inherits Window {
     }
 }
 
+// What the daemon did recently: files received, sent, deleted, conflicts.
+export component ActivityWindow inherits Window {
+    in property <[ActivityRow]> rows;
+    in-out property <int> current: -1;
+    callback show-item(int);
+    callback dismiss();
+
+    title: @tr("Recent activity");
+    icon: @image-url("../icons/app.png");
+    preferred-width: 560px;
+    preferred-height: 520px;
+    min-width: 400px;
+    min-height: 360px;
+
+    VerticalBox {
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-radius: 4px;
+            border-color: Palette.border;
+            ListView {
+                for row[i] in root.rows: Rectangle {
+                    height: 44px;
+                    background: i == root.current ? Palette.selection-background : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 10px;
+                        Text {
+                            text: Fmt.activity-symbol(row.kind);
+                            width: 18px;
+                            font-size: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            color: row.kind == "conflict" ? #e65100
+                                : row.kind == "deleted" || row.kind == "deleted-online" ? #c62828
+                                : i == root.current ? Palette.selection-foreground : Palette.foreground;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: Fmt.activity-title(row);
+                                overflow: elide;
+                                color: i == root.current ? Palette.selection-foreground : Palette.foreground;
+                            }
+                            Text {
+                                text: Fmt.activity-detail(row);
+                                font-size: 11px;
+                                overflow: elide;
+                                color: (i == root.current ? Palette.selection-foreground : Palette.foreground).transparentize(30%);
+                            }
+                        }
+                    }
+                    TouchArea {
+                        clicked => { root.current = i; }
+                        double-clicked => { root.current = i; root.show-item(i); }
+                    }
+                }
+            }
+            if root.rows.length == 0: Text {
+                text: @tr("Nothing synchronised recently.");
+                color: Palette.foreground.transparentize(40%);
+            }
+        }
+        HorizontalBox {
+            padding: 0;
+            Button {
+                text: @tr("Show in folder");
+                enabled: root.current >= 0 && root.rows[root.current].path != "";
+                clicked => { root.show-item(root.current); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: @tr("Close");
+                primary: true;
+                clicked => { root.dismiss(); }
+            }
+        }
+    }
+}
+
 export component Tray inherits SystemTrayIcon {
     in property <Status> status;
     icon: status.state == "idle" ? @image-url("../icons/idle.png")
@@ -759,6 +890,7 @@ export component Tray inherits SystemTrayIcon {
     Menu {
         MenuItem { title: Fmt.state-label(status.state); enabled: false; }
         MenuItem { title: @tr("Show window"); activated => { Logic.show-window(); } }
+        MenuItem { title: @tr("Recent activity"); activated => { Logic.show-activity(); } }
         if status.needs-login: MenuItem { title: @tr("Sign in again"); activated => { Logic.reconnect(); } }
         MenuSeparator { }
         MenuItem {

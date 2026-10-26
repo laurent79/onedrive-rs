@@ -8,7 +8,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use odrs_gui::{DriveRow, FolderRow, FoldersWindow, MainWindow, ReportWindow, ResyncWindow, Status};
+use odrs_gui::{ActivityRow, ActivityWindow, DriveRow, FolderRow, FoldersWindow, MainWindow, ReportWindow, ResyncWindow, Status};
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
 fn snapshot(window: &slint::Window, out: String) {
@@ -41,6 +41,32 @@ fn main() {
                     .map(StandardListViewItem::from)
                     .collect();
             w.set_items(ModelRc::from(Rc::new(VecModel::from(items))));
+            w.show().unwrap();
+            let weak = w.as_weak();
+            slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
+            slint::run_event_loop().unwrap();
+        }
+        "activity" => {
+            let w = ActivityWindow::new().unwrap();
+            let row = |kind: &str, name: &str, drive: &str, mins| ActivityRow {
+                kind: kind.into(),
+                name: name.into(),
+                drive: drive.into(),
+                mins,
+                path: format!("/home/u/{drive}/{name}").into(),
+                ..Default::default()
+            };
+            let rows = vec![
+                row("uploaded", "report.docx", "OneDrive", 0),
+                row("downloaded", "budget.xlsx", "Sales", 2),
+                ActivityRow { backup: "plan-pc-safeBackup-0001.odt".into(), ..row("conflict", "plan.odt", "Engineering", 5) },
+                row("deleted", "old-notes.txt", "OneDrive", 12),
+                row("deleted-online", "draft.md", "OneDrive", 30),
+                ActivityRow { count: 128, ..row("more", "", "Engineering", 75) },
+                ActivityRow { path: "".into(), ..row("initial-sync", "", "Engineering", 75) },
+            ];
+            w.set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+            w.set_current(1);
             w.show().unwrap();
             let weak = w.as_weak();
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
@@ -117,6 +143,6 @@ fn main() {
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
             slint::run_event_loop().unwrap();
         }
-        other => panic!("unknown window {other:?} (main, resync, report, folders)"),
+        other => panic!("unknown window {other:?} (main, resync, report, folders, activity)"),
     }
 }

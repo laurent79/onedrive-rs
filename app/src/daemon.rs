@@ -79,10 +79,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         .context("cannot claim io.github.onedrive_rs.OneDrive1 on the session bus (daemon already running?)")?;
     tracing::info!(interval = ?interval, ?mode, "daemon started");
     let verifier_task = tokio::spawn(verifier.clone().run(server.clone()));
-    // Event ids keep increasing across restarts (see odrs_ipc::Event::id).
-    let event_ids = AtomicU64::new(
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
-    );
+    let events = Arc::new(Events::load(paths.config_dir.join("events.json"), server.clone()).await);
 
     let mut statuses: Vec<DriveStatus> = Vec::new();
     let mut watchers: Vec<odrs_watch::Watcher> = Vec::new();
@@ -222,7 +219,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         let started = Instant::now();
         let mut sync_requested = false;
         let outcome = tokio::select! {
-            r = run_pass(&graph, &store, selected(&targets, only.as_ref()), mode, &server, &shared, &event_ids) => Some(r),
+            r = run_pass(&graph, &store, selected(&targets, only.as_ref()), mode, &server, &shared, &events) => Some(r),
             () = until_pause(&mut rx, &mut sync_requested) => None,
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -380,7 +377,7 @@ async fn run_pass(
     mode: SyncMode,
     server: &Server,
     statuses: &Arc<Mutex<Vec<DriveStatus>>>,
-    event_ids: &AtomicU64,
+    events: &Arc<Events>,
 ) -> PassOutcome {
     let mut out = PassOutcome { failures: Vec::new(), total: Progress::default(), deferred: 0 };
     for (i, t) in targets {
@@ -391,12 +388,18 @@ async fn run_pass(
             s.progress = Progress::default();
         });
         publish(server, statuses).await;
+        // Stopped (not aborted) after the pass, so that no event taken from the stats is lost.
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
         let ticker = tokio::spawn({
-            let (server, stats, statuses) = (server.clone(), stats.clone(), statuses.clone());
+            let (server, stats, statuses, events, name) = (server.clone(), stats.clone(), statuses.clone(), events.clone(), t.name.clone());
             async move {
                 let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
                 loop {
-                    tick.tick().await;
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = &mut stopped => break,
+                    }
+                    events.publish(events.activity(&name, &stats)).await;
                     let p = progress(&stats);
                     set_status(&statuses, i, |s| s.progress = p);
                     let _ = server.set_progress(p).await;
@@ -405,7 +408,8 @@ async fn run_pass(
             }
         });
         let result = odrs_engine::sync(graph.clone(), store, t.opts.clone(), stats.clone(), mode).await;
-        ticker.abort();
+        let _ = stop.send(());
+        let _ = ticker.await;
         let p = progress(&stats);
         crate::print_stats(&stats, started, &t.name);
         out.deferred += stats.deferred.load(Ordering::Relaxed);
@@ -435,10 +439,7 @@ async fn run_pass(
             }
         });
         publish(server, statuses).await;
-        let events = drive_events(&t.name, &stats, result.is_ok() && p.errors == 0, event_ids);
-        if let Err(e) = server.push_events(events).await {
-            tracing::debug!(error = %e, "cannot publish events");
-        }
+        events.publish(drive_events(&t.name, &stats, result.is_ok() && p.errors == 0, events)).await;
         if let Err(e) = result {
             tracing::error!(drive = %t.name, error = %e, "sync pass failed");
             out.failures.push((t.name.clone(), e));
@@ -449,24 +450,77 @@ async fn run_pass(
 
 /// What clients may want to notify about a drive's pass: each safeBackup made,
 /// and the end of a sync that enumerated the whole drive.
-fn drive_events(drive: &str, stats: &Stats, succeeded: bool, ids: &AtomicU64) -> Vec<Event> {
-    let time = now_rfc3339();
-    let event = |kind: &str, path: String, detail: String| Event {
-        id: ids.fetch_add(1, Ordering::Relaxed),
-        time: time.clone(),
-        kind: kind.into(),
-        drive: drive.into(),
-        path,
-        detail,
-    };
-    let mut out: Vec<Event> = std::mem::take(&mut *stats.backups.lock().unwrap())
-        .into_iter()
-        .map(|b| event("conflict", b.path.display().to_string(), b.backup.display().to_string()))
-        .collect();
+fn drive_events(drive: &str, stats: &Stats, succeeded: bool, events: &Events) -> Vec<Event> {
+    let mut out = events.activity(drive, stats);
+    let unlisted = stats.activity_unlisted();
+    if unlisted > 0 {
+        out.push(events.event("more", drive, String::new(), unlisted.to_string()));
+    }
+    out.extend(
+        std::mem::take(&mut *stats.backups.lock().unwrap())
+            .into_iter()
+            .map(|b| events.event("conflict", drive, b.path.display().to_string(), b.backup.display().to_string())),
+    );
     if succeeded && stats.full_enumeration.load(Ordering::Relaxed) {
-        out.push(event("initial-sync", String::new(), String::new()));
+        out.push(events.event("initial-sync", drive, String::new(), String::new()));
     }
     out
+}
+
+/// Recent events, published in the `Events` property and kept in
+/// `events.json` (config dir), so that the activity list survives a restart.
+pub(crate) struct Events {
+    /// Increasing, also across restarts (see odrs_ipc::Event::id).
+    ids: AtomicU64,
+    log: Mutex<Vec<Event>>,
+    file: PathBuf,
+    server: Server,
+}
+
+impl Events {
+    async fn load(file: PathBuf, server: Server) -> Self {
+        let log: Vec<Event> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let next = log.iter().map(|e| e.id + 1).max().unwrap_or(0).max(now);
+        if let Err(e) = server.push_events(log.clone()).await {
+            tracing::debug!(error = %e, "cannot publish events");
+        }
+        Self { ids: AtomicU64::new(next), log: Mutex::new(log), file, server }
+    }
+
+    fn event(&self, kind: &str, drive: &str, path: String, detail: String) -> Event {
+        let id = self.ids.fetch_add(1, Ordering::Relaxed);
+        Event { id, time: now_rfc3339(), kind: kind.into(), drive: drive.into(), path, detail }
+    }
+
+    /// Files the pass changed since the last call.
+    fn activity(&self, drive: &str, stats: &Stats) -> Vec<Event> {
+        std::mem::take(&mut *stats.activity.lock().unwrap())
+            .into_iter()
+            .map(|a| self.event(a.kind.as_str(), drive, a.path.display().to_string(), String::new()))
+            .collect()
+    }
+
+    async fn publish(&self, new: Vec<Event>) {
+        if new.is_empty() {
+            return;
+        }
+        let text = {
+            let mut log = self.log.lock().unwrap();
+            log.extend(new.iter().cloned());
+            let excess = log.len().saturating_sub(odrs_ipc::MAX_EVENTS);
+            log.drain(..excess);
+            serde_json::to_vec(&*log)
+        };
+        // Paths of the user's files: private.
+        let saved = text.map_err(std::io::Error::other).and_then(|t| crate::write_private(&self.file, &t));
+        if let Err(e) = saved {
+            tracing::warn!(error = %e, file = %self.file.display(), "cannot save recent events");
+        }
+        if let Err(e) = self.server.push_events(new).await {
+            tracing::debug!(error = %e, "cannot publish events");
+        }
+    }
 }
 
 async fn publish(server: &Server, statuses: &Mutex<Vec<DriveStatus>>) {

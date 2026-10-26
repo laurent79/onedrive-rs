@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use crate::convert::{is_safe_name, parse_graph_time, to_db_item};
 use crate::decide::{FileAction, decide_with_hash, decide_without_hash, is_local_deletion, may_delete_local};
 use crate::local::{self, LocalState};
-use crate::{Error, Stats, SyncOptions};
+use crate::{ActivityKind, Error, Stats, SyncOptions};
 
 struct Outcome {
     item: Item,
@@ -340,6 +340,7 @@ impl<'a> DownloadSync<'a> {
                     std::fs::remove_file(&path)?;
                     self.stats.deleted.fetch_add(1, Ordering::Relaxed);
                     tracing::info!(path = %rel, "deleted (removed online)");
+                    self.stats.record_activity(ActivityKind::Deleted, path.clone());
                 } else {
                     let backup = local::safe_backup(&path, &self.opts.device_name)?;
                     tracing::warn!(path = %rel, backup = %backup.display(), "deleted online but modified locally; kept as safeBackup");
@@ -375,6 +376,7 @@ impl<'a> DownloadSync<'a> {
         match outcome.result {
             Ok(_) => {
                 tracing::debug!(path = %outcome.path.display(), "downloaded");
+                self.stats.record_activity(ActivityKind::Downloaded, outcome.path.clone());
                 // The parent may have been deleted while downloading (it was drained first, so not here).
                 Ok(self.store.upsert(&outcome.item)?)
             }
