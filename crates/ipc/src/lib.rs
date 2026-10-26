@@ -156,6 +156,30 @@ pub struct Library {
     pub web_url: String,
 }
 
+/// A subfolder in a drive, from `ListFolders`, with its selective sync state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct Folder {
+    pub name: String,
+    /// Relative to the drive's sync folder, `/`-separated.
+    pub path: String,
+    /// Synced (its files and the subfolders no rule targets).
+    pub included: bool,
+    /// A rule targets something below it: its subfolders differ.
+    pub mixed: bool,
+    pub has_children: bool,
+}
+
+/// A folder as left by the user in the folder chooser, for `SetSelection`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct FolderChoice {
+    pub path: String,
+    pub included: bool,
+    /// Untouched while [`Folder::mixed`]: the rules below it are kept.
+    pub mixed: bool,
+    /// Its subfolders were listed, and are among the choices.
+    pub expanded: bool,
+}
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Drive management offered by the daemon. Answers do not wait for the sync
@@ -177,6 +201,14 @@ pub trait DriveManager: Send + Sync + 'static {
     fn cancel_verify(&self, name: String) -> std::result::Result<(), String>;
     /// Files that need attention after the last check of a drive.
     fn verify_report(&self, name: String) -> std::result::Result<Vec<VerifyFinding>, String>;
+    /// Online subfolders of `path` in a drive (empty: its top), with their state.
+    fn list_folders(&self, name: String, path: String) -> BoxFuture<'_, std::result::Result<Vec<Folder>, String>>;
+    /// Selective sync rules of a drive the folder chooser cannot show (kept as written).
+    fn custom_rules(&self, name: String) -> std::result::Result<Vec<String>, String>;
+    /// Sync only the chosen folders of a drive (every folder: no selective
+    /// sync). `delete_local`: also delete the local copies of what is no longer
+    /// synced (unchanged files only); otherwise they are kept.
+    fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> std::result::Result<(), String>;
 }
 
 /// Commands sent by clients to the daemon loop.
@@ -267,6 +299,21 @@ impl Service {
 
     async fn verify_report(&self, name: String) -> zbus::fdo::Result<Vec<VerifyFinding>> {
         self.manager.verify_report(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// Online subfolders of `path` in a drive, with their selective sync state.
+    async fn list_folders(&self, name: String, path: String) -> zbus::fdo::Result<Vec<Folder>> {
+        self.manager.list_folders(name, path).await.map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn custom_rules(&self, name: String) -> zbus::fdo::Result<Vec<String>> {
+        self.manager.custom_rules(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    /// Change which folders of a drive are synced; applied by a pass that starts now.
+    async fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> zbus::fdo::Result<()> {
+        self.manager.set_selection(name, choices, delete_local).map_err(zbus::fdo::Error::Failed)?;
+        self.send(Command::SyncNow)
     }
 
     /// Recent events, oldest first (at most [`MAX_EVENTS`]).
@@ -439,6 +486,9 @@ pub trait OneDrive {
     fn verify(&self, name: &str) -> zbus::Result<()>;
     fn cancel_verify(&self, name: &str) -> zbus::Result<()>;
     fn verify_report(&self, name: &str) -> zbus::Result<Vec<VerifyFinding>>;
+    fn list_folders(&self, name: &str, path: &str) -> zbus::Result<Vec<Folder>>;
+    fn custom_rules(&self, name: &str) -> zbus::Result<Vec<String>>;
+    fn set_selection(&self, name: &str, choices: &[FolderChoice], delete_local: bool) -> zbus::Result<()>;
     #[zbus(property)]
     fn verifications(&self) -> zbus::Result<Vec<VerifyStatus>>;
     #[zbus(property)]

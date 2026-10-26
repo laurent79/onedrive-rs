@@ -105,6 +105,10 @@ rule matches at any depth (and every folder is then synced, in case it contains
 a match). A trailing `/` (or `/*`) only matches folders. `*` and `?` match
 within a name, `**` any number of folders.
 
+The GUI writes this file for you: the folder icon of a drive opens a folder
+tree to tick (files at the top of the drive then stay synced, through
+`sync_root_files`); rules it cannot show are kept as written.
+
 Unlike the D client, no `--resync` is needed after changing `sync_list` or a
 `skip_*` option: the next pass notices it, forgets what is now excluded and
 enumerates the drive again to bring in what is now included. Local copies of

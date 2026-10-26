@@ -248,6 +248,39 @@ pub fn append_drive_section(path: &Path, d: &DriveConfig) -> Result<()> {
     Ok(())
 }
 
+/// Set `key = "value"` at the top level (`section` None) or in the
+/// `[drive "name"]` section of a config file: replace the key, or add it at
+/// the end of its part of the file (top-level keys before the first section).
+pub fn set_value(path: &Path, section: Option<&str>, key: &str, value: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let header = |l: &str| l.trim_start().starts_with('[');
+    let (start, end) = match section {
+        None => (0, lines.iter().position(|l| header(l)).unwrap_or(lines.len())),
+        Some(name) => {
+            let target = format!("[drive \"{name}\"]");
+            let at = lines.iter().position(|l| l.trim() == target).with_context(|| format!("no {target} in {}", path.display()))?;
+            (at + 1, lines[at + 1..].iter().position(|l| header(l)).map_or(lines.len(), |n| at + 1 + n))
+        }
+    };
+    let line = format!("{key} = \"{value}\"");
+    match (start..end).find(|&i| lines[i].trim_start().split('=').next().is_some_and(|k| k.trim() == key)) {
+        Some(i) => lines[i] = line,
+        None => {
+            let mut at = end;
+            while at > start && lines[at - 1].trim().is_empty() {
+                at -= 1;
+            }
+            lines.insert(at, line);
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 /// Remove the `[drive "name"]` section (header and its keys) from the config file.
 pub fn remove_drive_section(path: &Path, name: &str) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
@@ -365,6 +398,27 @@ mod tests {
         let c = Config::load(&p).unwrap();
         assert_eq!(c.drives.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Sales"]);
         assert!(c.sync_dir.is_some());
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn values_are_replaced_or_added() {
+        let p = std::env::temp_dir().join(format!("odrs-cfg-test-{}", std::process::id()));
+        std::fs::write(&p, "# mine\nthreads = \"4\"\nsync_dir = \"/old\"\n").unwrap();
+        set_value(&p, None, "sync_dir", "/new").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "# mine\nthreads = \"4\"\nsync_dir = \"/new\"\n");
+        std::fs::write(&p, "threads = \"4\"\n").unwrap();
+        set_value(&p, None, "sync_dir", "/x").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "threads = \"4\"\nsync_dir = \"/x\"\n");
+        std::fs::write(&p, "threads = \"4\"\n\n[drive \"L\"]\nsync_dir = \"/l\"\n\n[drive \"M\"]\nsync_dir = \"/m\"\n").unwrap();
+        set_value(&p, None, "sync_dir", "/x").unwrap();
+        set_value(&p, Some("L"), "sync_root_files", "true").unwrap();
+        set_value(&p, Some("M"), "sync_dir", "/n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "threads = \"4\"\nsync_dir = \"/x\"\n\n[drive \"L\"]\nsync_dir = \"/l\"\nsync_root_files = \"true\"\n\n[drive \"M\"]\nsync_dir = \"/n\"\n"
+        );
+        assert!(set_value(&p, Some("Nope"), "a", "b").is_err());
         std::fs::remove_file(&p).unwrap();
     }
 

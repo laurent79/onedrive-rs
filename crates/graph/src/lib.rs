@@ -12,5 +12,5 @@ pub mod types;
 pub use auth::{AuthConfig, LoopbackLogin, ManualLogin, TokenStore, Tokens};
 pub use client::{GRAPH_BASE, Graph, http_client};
 pub use error::{Error, Result};
-pub use types::{DeltaPage, Drive, DriveItem, DriveListing, SiteResource};
+pub use types::{ChildListing, DeltaPage, Drive, DriveItem, DriveListing, SiteResource};
 pub use upload::{CHUNK_SIZE, SIMPLE_UPLOAD_MAX, SessionStore, UploadTarget};

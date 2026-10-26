@@ -1,19 +1,28 @@
 //! Desktop UI: a status window listing the synchronised drives, a window to add
-//! a SharePoint library, and a tray icon (StatusNotifierItem), all driven over
-//! D-Bus by the daemon. The UI never performs sync I/O itself.
+//! a SharePoint library, a folder chooser (selective sync), and a tray icon
+//! (StatusNotifierItem), all driven over D-Bus by the daemon. The UI never
+//! performs sync I/O itself.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
-use odrs_ipc::{Client, DriveStatus, Snapshot, VerifyFinding, VerifyStatus};
+use odrs_ipc::{Client, DriveStatus, FolderChoice, Snapshot, VerifyFinding, VerifyStatus};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
 use tokio::sync::mpsc;
 
+use crate::folders::FolderTree;
 use crate::notify::{Action, Change, Note, Notifier, Watcher};
 
+mod folders;
 mod notify;
+
+thread_local! {
+    /// The folder chooser's state, on the UI thread.
+    static FOLDERS: RefCell<FolderTree> = RefCell::new(FolderTree::default());
+}
 
 slint::include_modules!();
 
@@ -49,126 +58,248 @@ enum UiCommand {
     /// Fetch the findings of a drive's last check and show them.
     ShowReport(String),
     Resync(String),
+    /// Subfolders of a folder for the folder chooser (empty path: the top).
+    ListFolders { drive: String, path: String },
+    CustomRules(String),
+    SetSelection { drive: String, choices: Vec<FolderChoice>, delete_local: bool },
 }
 
 /// Run the UI on the current thread until the user quits from the tray menu.
 /// `rt` hosts the D-Bus client; it must not be the thread calling `run`.
 pub fn run(rt: tokio::runtime::Handle, opts: Options) -> Result<(), Error> {
-    let window = MainWindow::new()?;
-    // Before the window is shown. Matches contrib/desktop/io.github.onedrive_rs.desktop,
+    // Creating a component initialises the Slint platform.
+    let tray = Tray::new()?;
+    // Before any window exists. Matches contrib/desktop/io.github.onedrive_rs.desktop,
     // from which Wayland compositors take the window icon.
     slint::set_xdg_app_id(APP_ID)?;
-    let tray = Tray::new()?;
-    let add = AddLibraryWindow::new()?;
-    let report = ReportWindow::new()?;
-    let resync = ResyncWindow::new()?;
-    let initial = to_status(None);
-    window.set_status(initial.clone());
-    tray.set_status(initial);
-    // Updated in place, so rows (and their pending "confirm removal") survive refreshes.
-    window.set_drives(ModelRc::from(Rc::new(VecModel::<DriveRow>::default())));
-
     let (tx, rx) = mpsc::unbounded_channel();
-    let start_daemon = Rc::new(opts.start_daemon);
-    let login = Rc::new(opts.login);
-
-    // Globals are per component instance: wire the window and the tray alike.
-    macro_rules! wire {
-        ($component:expr) => {{
-            let logic = $component.global::<Logic>();
-            let t = tx.clone();
-            logic.on_sync_now(move || {
-                let _ = t.send(UiCommand::SyncNow);
-            });
-            let t = tx.clone();
-            logic.on_toggle_pause(move || {
-                let _ = t.send(UiCommand::TogglePause);
-            });
-            logic.on_open_folder(|path| open_folder(&path));
-            let t = tx.clone();
-            logic.on_remove_drive(move |name| {
-                let _ = t.send(UiCommand::RemoveDrive(name.into()));
-            });
-            let t = tx.clone();
-            logic.on_verify(move |name| {
-                let _ = t.send(UiCommand::Verify(name.into()));
-            });
-            let t = tx.clone();
-            logic.on_cancel_verify(move |name| {
-                let _ = t.send(UiCommand::CancelVerify(name.into()));
-            });
-            let t = tx.clone();
-            logic.on_show_report(move |name| {
-                let _ = t.send(UiCommand::ShowReport(name.into()));
-            });
-            let r = resync.as_weak();
-            logic.on_resync(move |name| {
-                let Some(r) = r.upgrade() else { return };
-                r.set_drive_title(drive_title(&name).into());
-                r.set_drive_name(name);
-                let _ = r.show();
-            });
-            let (a, t) = (add.as_weak(), tx.clone());
-            logic.on_add_library(move || {
-                if let Some(a) = a.upgrade() {
-                    open_add_window(&a, &t);
-                }
-            });
-            let (t, start) = (tx.clone(), start_daemon.clone());
-            logic.on_start_daemon(move || {
-                if let Err(e) = start() {
-                    tracing::error!(error = %e, "could not start the daemon");
-                }
-                let _ = t.send(UiCommand::Refresh);
-            });
-            let (t, login) = (tx.clone(), login.clone());
-            logic.on_reconnect(move || match login() {
-                Ok(mut child) => {
-                    let t = t.clone();
-                    std::thread::spawn(move || {
-                        if child.wait().is_ok_and(|s| s.success()) {
-                            let _ = t.send(UiCommand::SyncNow);
-                        }
-                    });
-                }
-                Err(e) => tracing::error!(error = %e, "could not start the login"),
-            });
-            let w = window.as_weak();
-            logic.on_show_window(move || {
-                if let Some(w) = w.upgrade() {
-                    let _ = w.show();
-                }
-            });
-            logic.on_quit(|| {
-                let _ = slint::quit_event_loop();
-            });
-        }};
-    }
-    wire!(window);
-    wire!(tray);
-    wire_add_window(&add, &tx);
-    wire_report_window(&report, &tx, &rt);
-    let (r, t) = (resync.as_weak(), tx.clone());
-    resync.on_confirm(move || {
-        let Some(r) = r.upgrade() else { return };
-        let _ = t.send(UiCommand::Resync(r.get_drive_name().into()));
-        let _ = r.hide();
-    });
-    let r = resync.as_weak();
-    resync.on_cancel(move || {
-        if let Some(r) = r.upgrade() {
-            let _ = r.hide();
-        }
+    let ctx = Rc::new(Ctx { tx, rt: rt.clone(), start_daemon: opts.start_daemon, login: opts.login });
+    tray.set_status(to_status(None));
+    wire_logic(&tray.global::<Logic>(), &ctx);
+    UI.with(|u| {
+        let mut u = u.borrow_mut();
+        u.ctx = Some(ctx);
+        u.tray = Some(tray);
     });
 
-    rt.spawn(poll(rx, window.as_weak(), tray.as_weak(), add.as_weak(), report.as_weak()));
+    rt.spawn(poll(rx));
 
-    if !opts.hidden {
-        window.show()?;
+    if let Some(w) = (!opts.hidden).then(main_window).flatten() {
+        w.show()?;
     }
     // Closing the window only hides it; the tray keeps the app alive.
     slint::run_event_loop_until_quit()?;
     Ok(())
+}
+
+/// What the windows' callbacks need.
+struct Ctx {
+    tx: mpsc::UnboundedSender<UiCommand>,
+    rt: tokio::runtime::Handle,
+    /// Launch the background service when it is not running.
+    start_daemon: Box<dyn Fn() -> std::io::Result<()>>,
+    login: Box<dyn Fn() -> std::io::Result<std::process::Child>>,
+}
+
+impl Ctx {
+    fn send(&self, cmd: UiCommand) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+/// The UI thread's state. Windows are created when first opened: KDE Plasma
+/// lists a created Wayland window in the task bar even before it is shown, as
+/// an empty entry. Closing one destroys its surface, not the component.
+#[derive(Default)]
+struct Ui {
+    ctx: Option<Rc<Ctx>>,
+    tray: Option<Tray>,
+    main: Option<MainWindow>,
+    add: Option<AddLibraryWindow>,
+    report: Option<ReportWindow>,
+    resync: Option<ResyncWindow>,
+    folders: Option<FoldersWindow>,
+    /// Latest daemon state, for a main window opened later.
+    status: Status,
+    /// Updated in place, so rows (and their pending "confirm removal") survive refreshes.
+    drives: Rc<VecModel<DriveRow>>,
+}
+
+thread_local! {
+    static UI: RefCell<Ui> = RefCell::new(Ui::default());
+}
+
+fn ctx() -> Rc<Ctx> {
+    UI.with(|u| u.borrow().ctx.clone()).expect("UI context set by run()")
+}
+
+/// The window in `slot` if it was created.
+fn existing<T: slint::ComponentHandle>(slot: fn(&Ui) -> &Option<T>) -> Option<T> {
+    UI.with(|u| slot(&u.borrow()).as_ref().map(T::clone_strong))
+}
+
+/// The window in `slot`, created (and wired) by `create` the first time.
+fn lazy<T: slint::ComponentHandle>(
+    slot: fn(&mut Ui) -> &mut Option<T>,
+    create: fn(&Rc<Ctx>) -> Result<T, slint::PlatformError>,
+) -> Option<T> {
+    if let Some(w) = UI.with(|u| slot(&mut u.borrow_mut()).as_ref().map(T::clone_strong)) {
+        return Some(w);
+    }
+    match create(&ctx()) {
+        Ok(w) => {
+            UI.with(|u| *slot(&mut u.borrow_mut()) = Some(w.clone_strong()));
+            Some(w)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "cannot create a window");
+            None
+        }
+    }
+}
+
+fn main_window() -> Option<MainWindow> {
+    lazy(
+        |u| &mut u.main,
+        |ctx| {
+            let w = MainWindow::new()?;
+            let (status, drives) = UI.with(|u| {
+                let u = u.borrow();
+                (u.status.clone(), u.drives.clone())
+            });
+            w.set_status(status);
+            w.set_drives(ModelRc::from(drives));
+            wire_logic(&w.global::<Logic>(), ctx);
+            Ok(w)
+        },
+    )
+}
+
+fn add_window() -> Option<AddLibraryWindow> {
+    lazy(
+        |u| &mut u.add,
+        |ctx| {
+            let w = AddLibraryWindow::new()?;
+            wire_add_window(&w, &ctx.tx);
+            Ok(w)
+        },
+    )
+}
+
+fn report_window() -> Option<ReportWindow> {
+    lazy(
+        |u| &mut u.report,
+        |ctx| {
+            let w = ReportWindow::new()?;
+            wire_report_window(&w, &ctx.tx, &ctx.rt);
+            Ok(w)
+        },
+    )
+}
+
+fn resync_window() -> Option<ResyncWindow> {
+    lazy(
+        |u| &mut u.resync,
+        |ctx| {
+            let w = ResyncWindow::new()?;
+            let (r, t) = (w.as_weak(), ctx.tx.clone());
+            w.on_confirm(move || {
+                let Some(r) = r.upgrade() else { return };
+                let _ = t.send(UiCommand::Resync(r.get_drive_name().into()));
+                let _ = r.hide();
+            });
+            let r = w.as_weak();
+            w.on_cancel(move || {
+                if let Some(r) = r.upgrade() {
+                    let _ = r.hide();
+                }
+            });
+            Ok(w)
+        },
+    )
+}
+
+fn folders_window() -> Option<FoldersWindow> {
+    lazy(
+        |u| &mut u.folders,
+        |ctx| {
+            let w = FoldersWindow::new()?;
+            w.set_rows(ModelRc::from(Rc::new(VecModel::<FolderRow>::default())));
+            wire_folders_window(&w, &ctx.tx);
+            Ok(w)
+        },
+    )
+}
+
+/// Run `f` on the UI thread with the window `get` returns, if any.
+fn in_ui<T: 'static>(get: fn() -> Option<T>, f: impl FnOnce(T) + Send + 'static) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(w) = get() {
+            f(w);
+        }
+    });
+}
+
+/// Globals are per component instance: the main window and the tray are wired alike.
+fn wire_logic(logic: &Logic<'_>, ctx: &Rc<Ctx>) {
+    let c = ctx.clone();
+    logic.on_sync_now(move || c.send(UiCommand::SyncNow));
+    let c = ctx.clone();
+    logic.on_toggle_pause(move || c.send(UiCommand::TogglePause));
+    logic.on_open_folder(|path| open_folder(&path));
+    let c = ctx.clone();
+    logic.on_remove_drive(move |name| c.send(UiCommand::RemoveDrive(name.into())));
+    let c = ctx.clone();
+    logic.on_verify(move |name| c.send(UiCommand::Verify(name.into())));
+    let c = ctx.clone();
+    logic.on_cancel_verify(move |name| c.send(UiCommand::CancelVerify(name.into())));
+    let c = ctx.clone();
+    logic.on_show_report(move |name| c.send(UiCommand::ShowReport(name.into())));
+    logic.on_resync(move |name| {
+        let Some(r) = resync_window() else { return };
+        r.set_drive_title(drive_title(&name).into());
+        r.set_drive_name(name);
+        let _ = r.show();
+    });
+    let c = ctx.clone();
+    logic.on_choose_folders(move |name| {
+        if let Some(f) = folders_window() {
+            open_folders_window(&f, &name, &c.tx);
+        }
+    });
+    let c = ctx.clone();
+    logic.on_add_library(move || {
+        if let Some(a) = add_window() {
+            open_add_window(&a, &c.tx);
+        }
+    });
+    let c = ctx.clone();
+    logic.on_start_daemon(move || {
+        if let Err(e) = (c.start_daemon)() {
+            tracing::error!(error = %e, "could not start the daemon");
+        }
+        c.send(UiCommand::Refresh);
+    });
+    let c = ctx.clone();
+    logic.on_reconnect(move || match (c.login)() {
+        Ok(mut child) => {
+            let t = c.tx.clone();
+            std::thread::spawn(move || {
+                if child.wait().is_ok_and(|s| s.success()) {
+                    let _ = t.send(UiCommand::SyncNow);
+                }
+            });
+        }
+        Err(e) => tracing::error!(error = %e, "could not start the login"),
+    });
+    logic.on_show_window(|| {
+        if let Some(w) = main_window() {
+            let _ = w.show();
+        }
+    });
+    logic.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
 }
 
 fn open_add_window(a: &AddLibraryWindow, tx: &mpsc::UnboundedSender<UiCommand>) {
@@ -230,6 +361,88 @@ fn wire_add_window(add: &AddLibraryWindow, tx: &mpsc::UnboundedSender<UiCommand>
     add.on_cancel(move || {
         if let Some(a) = a.upgrade() {
             let _ = a.hide();
+        }
+    });
+}
+
+fn open_folders_window(f: &FoldersWindow, name: &str, tx: &mpsc::UnboundedSender<UiCommand>) {
+    FOLDERS.with(|t| *t.borrow_mut() = FolderTree::new(name));
+    f.set_drive_name(name.into());
+    f.set_drive_title(drive_title(name).into());
+    f.set_delete_local(false);
+    f.set_saving(false);
+    f.set_custom_rules(0);
+    f.set_message(SharedString::new());
+    refresh_folders(f);
+    let _ = f.show();
+    let _ = tx.send(UiCommand::ListFolders { drive: name.to_owned(), path: String::new() });
+    let _ = tx.send(UiCommand::CustomRules(name.to_owned()));
+}
+
+/// Show the folder chooser's current lines.
+fn refresh_folders(f: &FoldersWindow) {
+    let (rows, listed, selected) = FOLDERS.with(|t| {
+        let mut t = t.borrow_mut();
+        let rows: Vec<FolderRow> = t
+            .lines()
+            .into_iter()
+            .map(|l| FolderRow {
+                path: l.path.into(),
+                name: l.name.into(),
+                depth: i32::try_from(l.depth).unwrap_or(0),
+                check: match l.check {
+                    Some(false) => 0,
+                    Some(true) => 1,
+                    None => 2,
+                },
+                expanded: l.expanded,
+                has_children: l.has_children,
+                loading: l.loading,
+            })
+            .collect();
+        (rows, t.is_listed(), t.anything_selected())
+    });
+    if let Some(model) = f.get_rows().as_any().downcast_ref::<VecModel<FolderRow>>() {
+        model.set_vec(rows);
+    }
+    f.set_loading(!listed);
+    f.set_nothing_selected(listed && !selected);
+}
+
+fn wire_folders_window(folders: &FoldersWindow, tx: &mpsc::UnboundedSender<UiCommand>) {
+    let f = folders.as_weak();
+    folders.on_toggle(move |i| {
+        let Some(f) = f.upgrade() else { return };
+        FOLDERS.with(|t| t.borrow_mut().toggle(usize::try_from(i).unwrap_or(usize::MAX)));
+        refresh_folders(&f);
+    });
+    let (f, t) = (folders.as_weak(), tx.clone());
+    folders.on_expand(move |i| {
+        let Some(f) = f.upgrade() else { return };
+        let (drive, listing) = FOLDERS.with(|tree| {
+            let mut tree = tree.borrow_mut();
+            (tree.drive.clone(), tree.expand(usize::try_from(i).unwrap_or(usize::MAX)))
+        });
+        if let Some(path) = listing {
+            let _ = t.send(UiCommand::ListFolders { drive, path });
+        }
+        refresh_folders(&f);
+    });
+    let (f, t) = (folders.as_weak(), tx.clone());
+    folders.on_save(move || {
+        let Some(f) = f.upgrade() else { return };
+        let (drive, choices) = FOLDERS.with(|t| {
+            let t = t.borrow();
+            (t.drive.clone(), t.choices())
+        });
+        f.set_saving(true);
+        f.set_message(SharedString::new());
+        let _ = t.send(UiCommand::SetSelection { drive, choices, delete_local: f.get_delete_local() });
+    });
+    let f = folders.as_weak();
+    folders.on_cancel(move || {
+        if let Some(f) = f.upgrade() {
+            let _ = f.hide();
         }
     });
 }
@@ -311,13 +524,7 @@ fn default_folder(name: &str) -> String {
 }
 
 /// Refresh the UI from the daemon every [`REFRESH`] and forward user commands.
-async fn poll(
-    mut rx: mpsc::UnboundedReceiver<UiCommand>,
-    window: slint::Weak<MainWindow>,
-    tray: slint::Weak<Tray>,
-    add: slint::Weak<AddLibraryWindow>,
-    report: slint::Weak<ReportWindow>,
-) {
+async fn poll(mut rx: mpsc::UnboundedReceiver<UiCommand>) {
     let client = loop {
         match Client::new().await {
             Ok(c) => break c,
@@ -349,7 +556,7 @@ async fn poll(
             _ = tick.tick() => {}
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return };
-                handle(&client, cmd, last.as_ref(), &add, &report).await;
+                handle(&client, cmd, last.as_ref()).await;
             }
             Some(notes) = notes_rx.recv() => {
                 if let Some(n) = notifier.as_mut() {
@@ -362,13 +569,11 @@ async fn poll(
             Some(click) = next_click(&mut clicks) => {
                 let action = click.args().ok().and_then(|a| notifier.as_mut()?.action(a.id, &a.action_key));
                 match action {
-                    Some(Action::ShowWindow) => {
-                        let _ = window.upgrade_in_event_loop(|w| w.global::<Logic>().invoke_show_window());
-                    }
-                    Some(Action::Reconnect) => {
-                        let _ = window.upgrade_in_event_loop(|w| w.global::<Logic>().invoke_reconnect());
-                    }
-                    Some(Action::ShowReport(drive)) => handle(&client, UiCommand::ShowReport(drive), last.as_ref(), &add, &report).await,
+                    Some(Action::ShowWindow) => in_ui(main_window, |w| {
+                        let _ = w.show();
+                    }),
+                    Some(Action::Reconnect) => in_tray(|t| t.global::<Logic>().invoke_reconnect()),
+                    Some(Action::ShowReport(drive)) => handle(&client, UiCommand::ShowReport(drive), last.as_ref()).await,
                     Some(Action::ShowItem(path)) => show_in_folder(path).await,
                     Some(Action::OpenFolder(path)) => open_folder(&path),
                     None => {}
@@ -396,24 +601,24 @@ async fn poll(
         let changes = watcher.changes(snapshot.as_ref());
         if !changes.is_empty() {
             let notes_tx = notes_tx.clone();
-            let _ = window.upgrade_in_event_loop(move |w| {
-                let fmt = w.global::<Fmt>();
+            in_tray(move |t| {
+                let fmt = t.global::<Fmt>();
                 let _ = notes_tx.send(changes.iter().map(|c| to_note(&fmt, c)).collect());
             });
         }
         last = snapshot;
-        let s = status.clone();
-        let _ = window.upgrade_in_event_loop(move |w| {
-            if w.get_status() != s {
-                w.set_status(s);
-            }
-            if let Some(model) = w.get_drives().as_any().downcast_ref::<VecModel<DriveRow>>() {
-                sync_rows(model, rows);
-            }
-        });
-        let _ = tray.upgrade_in_event_loop(move |t| {
-            if t.get_status() != status {
-                t.set_status(status);
+        let _ = slint::invoke_from_event_loop(move || {
+            let (main, drives) = UI.with(|u| {
+                let mut u = u.borrow_mut();
+                u.status = status.clone();
+                if let Some(t) = u.tray.as_ref().filter(|t| t.get_status() != status) {
+                    t.set_status(status.clone());
+                }
+                (u.main.as_ref().map(MainWindow::clone_strong), u.drives.clone())
+            });
+            sync_rows(&drives, rows);
+            if let Some(w) = main.filter(|w| w.get_status() != status) {
+                w.set_status(status);
             }
         });
     }
@@ -472,13 +677,26 @@ fn to_note(fmt: &Fmt<'_>, change: &Change) -> Note {
     }
 }
 
-async fn handle(
-    client: &Client,
-    cmd: UiCommand,
-    last: Option<&Snapshot>,
-    add: &slint::Weak<AddLibraryWindow>,
-    report_window: &slint::Weak<ReportWindow>,
-) {
+/// Run `f` on the UI thread with the tray icon (always there).
+fn in_tray(f: impl FnOnce(&Tray) + Send + 'static) {
+    let _ = slint::invoke_from_event_loop(move || {
+        UI.with(|u| {
+            if let Some(t) = &u.borrow().tray {
+                f(t);
+            }
+        });
+    });
+}
+
+fn existing_add() -> Option<AddLibraryWindow> {
+    existing(|u| &u.add)
+}
+
+fn existing_folders() -> Option<FoldersWindow> {
+    existing(|u| &u.folders)
+}
+
+async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>) {
     let d = client.daemon();
     match cmd {
         UiCommand::SyncNow => report(d.sync_now().await, "sync now"),
@@ -498,7 +716,7 @@ async fn handle(
                     return;
                 }
             };
-            let _ = report_window.upgrade_in_event_loop(move |r| {
+            in_ui(report_window, move |r| {
                 r.set_drive_name(name.into());
                 r.set_drive_title(title.into());
                 r.set_current(-1);
@@ -508,9 +726,48 @@ async fn handle(
                 let _ = r.show();
             });
         }
+        UiCommand::ListFolders { drive, path } => {
+            let result = d.list_folders(&drive, &path).await;
+            in_ui(existing_folders, move |f| {
+                FOLDERS.with(|t| {
+                    let mut t = t.borrow_mut();
+                    if t.drive != drive {
+                        return;
+                    }
+                    match result {
+                        Ok(list) => t.add_children(&path, list),
+                        Err(e) => {
+                            t.listing_failed(&path);
+                            f.set_message(daemon_message(&e).into());
+                        }
+                    }
+                });
+                refresh_folders(&f);
+            });
+        }
+        UiCommand::CustomRules(drive) => {
+            let n = d.custom_rules(&drive).await.map_or(0, |r| r.len());
+            in_ui(existing_folders, move |f| {
+                if f.get_drive_name() == drive {
+                    f.set_custom_rules(i32::try_from(n).unwrap_or(i32::MAX));
+                }
+            });
+        }
+        UiCommand::SetSelection { drive, choices, delete_local } => {
+            let result = d.set_selection(&drive, &choices, delete_local).await;
+            in_ui(existing_folders, move |f| {
+                f.set_saving(false);
+                match result {
+                    Ok(()) => {
+                        let _ = f.hide();
+                    }
+                    Err(e) => f.set_message(daemon_message(&e).into()),
+                }
+            });
+        }
         UiCommand::SearchSites(query) => {
             let result = d.search_sites(&query).await;
-            let _ = add.upgrade_in_event_loop(move |a| {
+            in_ui(existing_add, move |a| {
                 a.set_busy(false);
                 match result {
                     Ok(sites) => {
@@ -526,7 +783,7 @@ async fn handle(
         }
         UiCommand::ListLibraries(site_id) => {
             let result = d.list_libraries(&site_id).await;
-            let _ = add.upgrade_in_event_loop(move |a| {
+            in_ui(existing_add, move |a| {
                 a.set_busy(false);
                 match result {
                     Ok(libs) => {
@@ -544,7 +801,7 @@ async fn handle(
         }
         UiCommand::AddDrive { name, drive_id, sync_dir } => {
             let result = d.add_drive(&name, &drive_id, &sync_dir).await;
-            let _ = add.upgrade_in_event_loop(move |a| {
+            in_ui(existing_add, move |a| {
                 a.set_busy(false);
                 match result {
                     Ok(()) => {
@@ -569,14 +826,17 @@ fn report(result: zbus::Result<()>, what: &str) {
     }
 }
 
-fn show_error(a: &AddLibraryWindow, e: &zbus::Error) {
-    // Daemon-side failures arrive as org.freedesktop.DBus.Error.Failed with a readable message.
-    let msg = match e {
+/// Daemon-side failures arrive as org.freedesktop.DBus.Error.Failed with a readable message.
+fn daemon_message(e: &zbus::Error) -> String {
+    match e {
         zbus::Error::MethodError(_, Some(detail), _) => detail.clone(),
         other => other.to_string(),
-    };
+    }
+}
+
+fn show_error(a: &AddLibraryWindow, e: &zbus::Error) {
     a.set_no_results(false);
-    a.set_message(msg.into());
+    a.set_message(daemon_message(e).into());
     a.set_message_is_error(true);
 }
 

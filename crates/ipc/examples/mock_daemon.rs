@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use odrs_ipc::{
-    BoxFuture, Command, DriveManager, DriveStatus, Event, Info, Library, Progress, Server, Site, State, VerifyFinding, VerifyStatus,
+    BoxFuture, Command, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, Library, Progress, Server, Site, State, VerifyFinding,
+    VerifyStatus,
 };
 use tokio::sync::mpsc;
 
@@ -75,6 +76,20 @@ async fn main() -> odrs_ipc::Result<()> {
 struct Mock {
     added: Mutex<Vec<(String, String, String)>>,
     verifications: Mutex<Vec<VerifyStatus>>,
+    /// Folders left unchecked by the last SetSelection.
+    excluded: Mutex<Vec<String>>,
+}
+
+/// Subfolders of the fake drives.
+fn fake_folders(path: &str) -> &'static [&'static str] {
+    match path {
+        "" => &["Documents", "Music", "Pictures", "Teams"],
+        "Documents" => &["Invoices", "Old"],
+        "Pictures" => &["2023", "2024", "Camera Roll"],
+        "Teams" => &["Engineering", "Sales"],
+        "Teams/Engineering" => &["build", "specs"],
+        _ => &[],
+    }
 }
 
 /// `main` always ends with a few problems, to show the report.
@@ -204,5 +219,37 @@ impl DriveManager for Mock {
     fn verify_report(&self, name: String) -> Result<Vec<VerifyFinding>, String> {
         let v = self.verifications.lock().unwrap();
         Ok(if name == "main" && v.iter().any(|s| s.name == "main" && s.state == "done") { fake_findings() } else { Vec::new() })
+    }
+
+    fn list_folders(&self, _name: String, path: String) -> BoxFuture<'_, Result<Vec<Folder>, String>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let excluded = self.excluded.lock().unwrap();
+            Ok(fake_folders(&path)
+                .iter()
+                .map(|name| {
+                    let path = if path.is_empty() { (*name).to_owned() } else { format!("{path}/{name}") };
+                    let included = !excluded.iter().any(|e| path == *e || path.starts_with(&format!("{e}/")));
+                    let mixed = excluded.iter().any(|e| e.starts_with(&format!("{path}/")));
+                    Folder { name: (*name).into(), has_children: !fake_folders(&path).is_empty(), path, included, mixed }
+                })
+                .collect())
+        })
+    }
+
+    fn custom_rules(&self, name: String) -> Result<Vec<String>, String> {
+        Ok(if name == "main" { vec!["!*.tmp".into()] } else { Vec::new() })
+    }
+
+    fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> Result<(), String> {
+        if !choices.iter().any(|c| c.included) {
+            return Err("no folder is selected".into());
+        }
+        println!("selection of {name} (delete local copies: {delete_local}):");
+        for c in &choices {
+            println!("  {} {}", if c.included { "[x]" } else { "[ ]" }, c.path);
+        }
+        *self.excluded.lock().unwrap() = choices.into_iter().filter(|c| !c.included).map(|c| c.path).collect();
+        Ok(())
     }
 }

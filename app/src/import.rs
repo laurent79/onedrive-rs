@@ -65,10 +65,10 @@ pub async fn run(paths: &Paths, auth: AuthConfig, from: PathBuf, name: Option<St
         eprintln!("Previous database kept as {}", backup.display());
     }
     std::fs::rename(&staging, &ours)?;
-    set_config_value(&paths.config(), "sync_dir", &sync_dir.display().to_string())?;
+    config::set_value(&paths.config(), None, "sync_dir", &sync_dir.display().to_string())?;
     // The imported database reflects D's filters: keep them.
     for (key, value) in d_cfg.filters.entries() {
-        set_config_value(&paths.config(), key, &value)?;
+        config::set_value(&paths.config(), None, key, &value)?;
         eprintln!("{key} = \"{value}\" taken from the D configuration");
     }
     import_sync_list(&from, &config::sync_list_path(&paths.config_dir, "main"))?;
@@ -148,55 +148,4 @@ fn import_sync_list(from: &Path, to: &Path) -> Result<()> {
     std::fs::copy(&source, to).with_context(|| format!("copying {}", source.display()))?;
     eprintln!("Selective sync rules copied to {}", to.display());
     Ok(())
-}
-
-/// Replace `key = "..."` in a D-style config file, or append it.
-fn set_config_value(path: &Path, key: &str, value: &str) -> Result<()> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let line = format!("{key} = \"{value}\"");
-    let mut found = false;
-    let mut in_section = false;
-    let mut out: Vec<String> = text
-        .lines()
-        .map(|l| {
-            in_section |= l.trim_start().starts_with('[');
-            let is_key = !in_section && l.trim_start().split('=').next().is_some_and(|k| k.trim() == key);
-            if is_key && !found {
-                found = true;
-                line.clone()
-            } else {
-                l.to_owned()
-            }
-        })
-        .collect();
-    if !found {
-        // Top-level keys must stay before the first [drive] section.
-        let at = out.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(out.len());
-        out.insert(at, line);
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, out.join("\n") + "\n")?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_value_is_replaced_or_appended() {
-        let p = std::env::temp_dir().join(format!("odrs-cfg-test-{}", std::process::id()));
-        std::fs::write(&p, "# mine\nthreads = \"4\"\nsync_dir = \"/old\"\n").unwrap();
-        set_config_value(&p, "sync_dir", "/new").unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "# mine\nthreads = \"4\"\nsync_dir = \"/new\"\n");
-        std::fs::write(&p, "threads = \"4\"\n").unwrap();
-        set_config_value(&p, "sync_dir", "/x").unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "threads = \"4\"\nsync_dir = \"/x\"\n");
-        std::fs::write(&p, "threads = \"4\"\n[drive \"L\"]\nsync_dir = \"/l\"\n").unwrap();
-        set_config_value(&p, "sync_dir", "/x").unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "threads = \"4\"\nsync_dir = \"/x\"\n[drive \"L\"]\nsync_dir = \"/l\"\n");
-        std::fs::remove_file(&p).unwrap();
-    }
 }

@@ -1,4 +1,4 @@
-import { Button, LineEdit, ListView, ProgressIndicator, Spinner, StandardListView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, ProgressIndicator, Spinner, StandardListView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
 
 // Daemon-wide state, pushed from Rust once per second.
 export struct Status {
@@ -51,6 +51,19 @@ export struct DriveRow {
     verify-message: string,
 }
 
+// One line of the folder chooser (a folder of the drive, at some depth).
+export struct FolderRow {
+    path: string,
+    name: string,
+    depth: int,
+    // 0: not synced, 1: synced, 2: partly (some subfolders differ).
+    check: int,
+    expanded: bool,
+    has-children: bool,
+    // Its subfolders are being listed.
+    loading: bool,
+}
+
 export global Logic {
     callback sync-now();
     callback toggle-pause();
@@ -62,6 +75,8 @@ export global Logic {
     callback show-report(string);
     // Ask for confirmation, then rebuild the drive's database (drive name).
     callback resync(string);
+    // Open the folder chooser of a drive (selective sync).
+    callback choose-folders(string);
     callback add-library();
     callback start-daemon();
     callback reconnect();
@@ -258,6 +273,11 @@ component DriveView inherits Rectangle {
                     tooltip: @tr("Check that the local files are intact");
                     enabled: drive.state != "pending";
                     clicked => { Logic.verify(drive.name); }
+                }
+                IconButton {
+                    icon: @image-url("../icons/choose-folders.svg");
+                    tooltip: @tr("Choose the folders to synchronise");
+                    clicked => { Logic.choose-folders(drive.name); }
                 }
                 IconButton {
                     icon: @image-url("../icons/resync.svg");
@@ -554,6 +574,143 @@ export component ResyncWindow inherits Window {
                 text: @tr("Resynchronise");
                 primary: true;
                 clicked => { root.confirm(); }
+            }
+        }
+    }
+}
+
+// Three-state box of the folder chooser.
+component FolderCheck inherits Rectangle {
+    in property <int> check;
+    callback clicked();
+    width: 16px;
+    height: 16px;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: root.check == 0 ? Palette.border : Palette.accent-background;
+    background: root.check == 0 ? Palette.control-background : Palette.accent-background;
+    if root.check != 0: Text {
+        text: root.check == 1 ? "✓" : "–";
+        color: Palette.accent-foreground;
+        font-size: 12px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+// Selective sync: which folders of a drive are synchronised on this computer.
+export component FoldersWindow inherits Window {
+    in property <string> drive-name;
+    in property <string> drive-title;
+    in property <[FolderRow]> rows;
+    // The top level is being listed.
+    in property <bool> loading;
+    in property <bool> saving;
+    // No folder would be synchronised: saving is not possible.
+    in property <bool> nothing-selected;
+    // Rules of the sync_list file the chooser cannot show, kept as written.
+    in property <int> custom-rules;
+    in property <string> message;
+    in-out property <bool> delete-local;
+    callback toggle(int);
+    callback expand(int);
+    callback save();
+    callback cancel();
+
+    title: @tr("Choose folders — {}", root.drive-title);
+    icon: @image-url("../icons/app.png");
+    preferred-width: 520px;
+    preferred-height: 600px;
+    min-width: 420px;
+    min-height: 480px;
+
+    VerticalBox {
+        Text {
+            text: @tr("Choose the folders of “{}” to synchronise on this computer.", root.drive-title);
+            wrap: word-wrap;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-radius: 4px;
+            border-color: Palette.border;
+            ListView {
+                for row[i] in root.rows: HorizontalLayout {
+                    height: 28px;
+                    padding-left: 6px + row.depth * 20px;
+                    padding-right: 6px;
+                    spacing: 6px;
+                    Rectangle {
+                        width: 16px;
+                        if row.has-children: Text {
+                            text: row.loading ? "…" : row.expanded ? "▾" : "▸";
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                        if row.has-children: TouchArea { clicked => { root.expand(i); } }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        FolderCheck {
+                            check: row.check;
+                            clicked => { root.toggle(i); }
+                        }
+                    }
+                    Text {
+                        text: row.name;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        TouchArea {
+                            clicked => { root.toggle(i); }
+                            double-clicked => { if row.has-children { root.expand(i); } }
+                        }
+                    }
+                }
+            }
+            if root.loading: Spinner { indeterminate: true; width: 28px; height: 28px; }
+        }
+        Text {
+            text: @tr("Files directly at the top of the drive are always synchronised. A folder no longer synchronised keeps its local copy, unless you tick the box below; files changed locally are kept in any case.");
+            wrap: word-wrap;
+            font-size: 11px;
+            color: Palette.foreground.transparentize(30%);
+        }
+        if root.custom-rules > 0: Text {
+            text: @tr("{n} rule written by hand in the sync_list file is kept as is." | "{n} rules written by hand in the sync_list file are kept as they are." % root.custom-rules);
+            wrap: word-wrap;
+            font-size: 11px;
+            color: Palette.foreground.transparentize(30%);
+        }
+        CheckBox {
+            text: @tr("Also delete the local copy of removed folders");
+            checked <=> root.delete-local;
+        }
+        if root.message != "": Text {
+            text: root.message;
+            color: #c62828;
+            wrap: word-wrap;
+        }
+        HorizontalBox {
+            padding: 0;
+            if root.saving: Spinner { indeterminate: true; width: 18px; height: 18px; }
+            if root.nothing-selected && !root.loading: Text {
+                text: @tr("Select at least one folder.");
+                vertical-alignment: center;
+                color: #e65100;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.cancel(); }
+            }
+            Button {
+                text: @tr("Save");
+                primary: true;
+                enabled: !root.loading && !root.saving && !root.nothing-selected;
+                clicked => { root.save(); }
             }
         }
     }

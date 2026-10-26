@@ -176,6 +176,29 @@ pub struct DriveListing {
     pub web_url: Option<String>,
 }
 
+/// A child of a folder, as listed by `/children` (only what a folder chooser needs).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildListing {
+    pub name: String,
+    pub folder: Option<FolderFacet>,
+    pub package: Option<Package>,
+    pub remote_item: Option<IgnoredAny>,
+}
+
+impl ChildListing {
+    /// A plain folder (not a OneNote notebook nor a shortcut to a shared folder).
+    pub fn is_folder(&self) -> bool {
+        self.folder.is_some() && self.package.is_none() && self.remote_item.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderFacet {
+    pub child_count: Option<i64>,
+}
+
 /// A page of an OData collection.
 #[derive(Debug, Deserialize)]
 pub struct Page<T> {

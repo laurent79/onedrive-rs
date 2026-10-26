@@ -80,7 +80,8 @@ impl<'a> DownloadSync<'a> {
             self.store.upsert(&root_item)?;
         }
         if let Some(dir) = &self.opts.filter_state {
-            crate::selective::apply_filter_change(self.store, &root_item, &self.opts.filters, dir)?;
+            let delete_in = self.opts.delete_excluded.then_some(self.opts.sync_dir.as_path());
+            crate::selective::apply_filter_change(self.store, &root_item, &self.opts.filters, dir, delete_in)?;
         }
         // Overall progress: what is already synced versus the size of the whole drive.
         self.stats.drive_bytes.store(root.size.unwrap_or(0).max(0) as u64, Ordering::Relaxed);

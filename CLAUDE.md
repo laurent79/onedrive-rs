@@ -33,6 +33,9 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
 - HTTP : `reqwest` 0.13 (`rustls,json,stream,http2,form,query`, pas d'OpenSSL).
 - GUI : Slint plutôt que GTK4 (cible KDE Plasma ; libadwaita y détonne). `renderer-software` seulement :
   ~28 Mo RSS contre ~83 Mo avec femtovg/Mesa.
+  Fenêtres créées à leur première ouverture (`lazy` dans `crates/gui/src/lib.rs`) : Slint/winit crée le toplevel Wayland
+  dès la création du composant, et Plasma liste ces fenêtres jamais montrées comme entrées vides de la barre des tâches
+  (`hide()` ne les détruit pas ; une fenêtre montrée puis fermée, si). Seule l'icône de notification existe au départ.
 
 ## Comportement de synchronisation (aligné sur le client D)
 
@@ -73,6 +76,15 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   Élément suivi déplacé en ligne vers une zone exclue = suppression locale (si inchangé) ; parent hors base reconnu
   seulement s'il a été exclu pendant la passe (`excluded_dirs`, comme `skippedItems` de D : `/delta` ne garantit
   pas l'ordre parent/enfant). Côté envoi, une ligne DB exclue n'est jamais une suppression en ligne.
+- Choix des dossiers dans la GUI (`FoldersWindow`, `crates/gui/src/folders.rs`) : D-Bus `ListFolders` (sous-dossiers en
+  ligne d'un chemin, `Graph::child_folders`, état `SyncList::folder_state` : inclus / `mixed` = une règle ancrée vise
+  plus bas), `CustomRules`, `SetSelection(choix, delete_local)`. Règles générées par `filter::selection_rules` :
+  `/dossier/` et `!/dossier/` seulement ; règles non représentables (jokers, sans `/`) et règles sous un dossier ni
+  ouvert ni modifié recopiées telles quelles ; tout coché = fichier supprimé. Une exclusion l'emporte toujours (D) :
+  dossier décoché contenant un sous-dossier coché → gardé avec exclusions des autres. Écrit aussi
+  `sync_root_files = "true"` (fichiers à la racine toujours synchronisés, comme le client Windows).
+  `delete_local` → `SyncOptions::delete_excluded` jusqu'à une passe réussie du drive : copies locales supprimées si
+  mtime = DB, dossiers seulement s'ils deviennent vides.
 - Permissions : dossiers 0700, fichiers 0600 (défauts D).
 - Changements en ligne quasi instantanés (`odrs_graph::realtime`, comme `socketio.d` de D) : par drive,
   `GET /drives/{id}/root/subscriptions/socketIo` → `notificationUrl`, WebSocket Socket.IO v4 (`40`, `40/notifications`,
@@ -140,7 +152,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 - `cargo test` ; scénarios d'upload sans réseau : `crates/engine/tests/upload_dry_run.rs` (mode dry-run).
 - `cargo run -p odrs-ipc --example mock_daemon` : faux daemon (drives, sites) pour travailler la GUI.
 - Rendu d'une fenêtre sans capturer le bureau : `kwin_wayland --virtual --socket odrs-snap --exit-with-session
-  "target/debug/examples/snapshot <main|resync|report> /tmp/w.rgba"` (`LANG=fr_FR.UTF-8` pour le français), puis
+  "target/debug/examples/snapshot <main|resync|report|folders> /tmp/w.rgba"` (`LANG=fr_FR.UTF-8` pour le français), puis
   `magick -size <LxH affiché> -depth 8 rgba:/tmp/w.rgba w.png`. Le texte replié est mesuré sur une ligne par
   Slint : donner un `min-height` aux fenêtres de texte.
 - `cargo run -p odrs-graph --example download -- <refresh_token> <drive> <item> <dest>` : test de reprise.
@@ -155,8 +167,7 @@ CREATE INDEX selectByPath_idx ON item (name, driveId, parentId);
 
 - Icône de fenêtre absente dans la barre des tâches KDE (Wayland) malgré `app_id` = `io.github.onedrive_rs`
   et `.desktop` installé ; piste : `xdg_toplevel_icon_v1` (non géré par winit/Slint).
-- À faire : sélection des dossiers dans la GUI (sync sélective), éléments partagés (`remote`), progression des
-  envois, application Entra dédiée, paquet RPM.
+- À faire : éléments partagés (`remote`), progression des envois, application Entra dédiée, paquet RPM.
 
 ## Conventions
 

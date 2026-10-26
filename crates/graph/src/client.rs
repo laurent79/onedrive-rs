@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::{self, AuthConfig, TokenStore, Tokens};
 use crate::error::{Error, Result};
-use crate::types::{DELTA_SELECT, DeltaPage, Drive, DriveItem, DriveListing, Page, SiteResource};
+use crate::types::{ChildListing, DELTA_SELECT, DeltaPage, Drive, DriveItem, DriveListing, Page, SiteResource};
 
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 pub(crate) const USER_AGENT: &str = concat!("ISV|onedrive-rs|onedrive-rs/", env!("CARGO_PKG_VERSION"));
@@ -192,6 +192,33 @@ impl Graph {
     /// Document libraries of a site.
     pub async fn site_drives(&self, site_id: &str) -> Result<Vec<DriveListing>> {
         self.collect_pages(format!("{GRAPH_BASE}/sites/{site_id}/drives?$select=id,name,driveType,webUrl")).await
+    }
+
+    /// Subfolders of `path` (`/`-separated, empty for the root) in a drive
+    /// (`None`: the account's own OneDrive).
+    pub async fn child_folders(&self, drive_id: Option<&str>, path: &str) -> Result<Vec<ChildListing>> {
+        let mut url = url::Url::parse(GRAPH_BASE).expect("valid base URL");
+        {
+            let mut segments = url.path_segments_mut().expect("base URL with a path");
+            match drive_id {
+                Some(id) => segments.extend(["drives", id]),
+                None => segments.extend(["me", "drive"]),
+            };
+            let names: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            match names.split_last() {
+                None => {
+                    segments.push("root");
+                }
+                Some((last, parents)) => {
+                    // root:/a/b:/children addresses a folder by path.
+                    segments.push("root:").extend(parents).push(&format!("{last}:"));
+                }
+            }
+            segments.push("children");
+        }
+        url.set_query(Some("$select=name,folder,package,remoteItem&$top=999"));
+        let children: Vec<ChildListing> = self.collect_pages(url.into()).await?;
+        Ok(children.into_iter().filter(ChildListing::is_folder).collect())
     }
 
     /// Follow `@odata.nextLink` (bounded: these lists are for humans to pick from).

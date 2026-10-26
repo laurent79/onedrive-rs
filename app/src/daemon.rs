@@ -11,8 +11,8 @@ use anyhow::{Context as _, Result};
 use odrs_engine::{Stats, SyncMode};
 use odrs_graph::{AuthConfig, Graph};
 use odrs_ipc::{
-    AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Event, Info, Library, OFFLINE_ERROR_PREFIX, Progress, Server,
-    Site, State, VerifyFinding,
+    AUTH_ERROR_PREFIX, BoxFuture, Command, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, Library, OFFLINE_ERROR_PREFIX,
+    Progress, Server, Site, State, VerifyFinding,
 };
 use odrs_store::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -40,6 +40,9 @@ pub(crate) struct Drives {
     removed: Vec<String>,
     /// Drives to resync before the next pass (names).
     resync: Vec<String>,
+    /// Drives whose new folder selection also deletes the local copies of
+    /// what is no longer synced (names), until a pass of the drive succeeds.
+    delete_excluded: HashSet<String>,
     /// Bumped on every change, so the loop knows to rebuild its watchers.
     version: u64,
 }
@@ -58,7 +61,8 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             String::new()
         }
     };
-    let drives = Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), resync: Vec::new(), version: 0 }));
+    let drives =
+        Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), resync: Vec::new(), delete_excluded: HashSet::new(), version: 0 }));
     let verifier = Verifier::new(paths.db(), paths.config_dir.join("verify.json"), drives.clone());
     let realtime = cfg.disable_websocket_support != Some(true);
     let manager = Arc::new(Manager {
@@ -200,6 +204,19 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         };
         remote_next = None;
 
+        // A folder selection may have changed while waiting.
+        let mut targets = targets;
+        let delete_excluded = {
+            let d = drives.lock().unwrap();
+            for t in &mut targets {
+                if let Some(current) = d.targets.iter().find(|c| c.name == t.name) {
+                    t.opts.filters = current.opts.filters.clone();
+                }
+                t.opts.delete_excluded = d.delete_excluded.contains(&t.name);
+            }
+            d.delete_excluded.clone()
+        };
+
         server.set_state(State::Syncing).await?;
         let shared = Arc::new(Mutex::new(statuses.clone()));
         let started = Instant::now();
@@ -223,6 +240,17 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             continue;
         };
         tracing::info!(elapsed = ?started.elapsed(), drives = only.as_ref().map_or(targets.len(), HashSet::len), "pass finished");
+        // Local copies deleted along with a folder selection: done once the drive's pass went through.
+        let done: Vec<&String> = delete_excluded
+            .iter()
+            .filter(|n| only.as_ref().is_none_or(|o| o.contains(*n)) && !outcome.failures.iter().any(|(f, _)| f == *n))
+            .collect();
+        if !done.is_empty() {
+            let mut d = drives.lock().unwrap();
+            for name in done {
+                d.delete_excluded.remove(name);
+            }
+        }
         server.set_progress(outcome.total).await?;
         if outcome.failures.is_empty() && outcome.total.errors == 0 && only.is_some() && statuses.iter().any(|s| s.state == "error") {
             // Another drive, not part of this pass, is still in error: keep showing it.
@@ -522,6 +550,23 @@ struct Manager {
     verifier: Verifier,
 }
 
+impl Manager {
+    fn target(&self, name: &str) -> std::result::Result<Target, String> {
+        let drives = self.drives.lock().unwrap();
+        drives.targets.iter().find(|t| t.name == name).cloned().ok_or_else(|| format!("no drive named \"{name}\""))
+    }
+
+    /// The drive's current selective sync file, empty if none.
+    fn sync_list_text(t: &Target) -> std::result::Result<String, String> {
+        let Some(file) = &t.opts.sync_list_file else { return Ok(String::new()) };
+        match std::fs::read_to_string(file) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("{}: {e}", file.display())),
+        }
+    }
+}
+
 impl DriveManager for Manager {
     fn search_sites(&self, query: String) -> BoxFuture<'_, std::result::Result<Vec<Site>, String>> {
         Box::pin(async move {
@@ -622,6 +667,71 @@ impl DriveManager for Manager {
 
     fn verify_report(&self, name: String) -> std::result::Result<Vec<VerifyFinding>, String> {
         self.verifier.report(&name)
+    }
+
+    fn list_folders(&self, name: String, path: String) -> BoxFuture<'_, std::result::Result<Vec<Folder>, String>> {
+        Box::pin(async move {
+            let t = self.target(&name)?;
+            let list = odrs_engine::filter::SyncList::parse(&Self::sync_list_text(&t)?).0;
+            // Folders the other filters exclude cannot be chosen.
+            let skip = odrs_engine::filter::Filters { sync_list: None, ..t.opts.filters.clone() };
+            let children = self.graph.child_folders(t.opts.drive_id.as_deref(), &path).await.map_err(|e| e.to_string())?;
+            let mut out: Vec<Folder> = children
+                .into_iter()
+                .filter_map(|c| {
+                    let rel = if path.is_empty() { c.name.clone() } else { format!("{path}/{}", c.name) };
+                    if skip.excludes(&c.name, &rel, true) {
+                        return None;
+                    }
+                    let state = odrs_engine::filter::SyncList::folder_state(list.as_ref(), &rel);
+                    let has_children = c.folder.and_then(|f| f.child_count).is_some_and(|n| n > 0);
+                    Some(Folder { name: c.name, path: rel, included: state.included, mixed: state.mixed, has_children })
+                })
+                .collect();
+            out.sort_by_key(|f| f.name.to_lowercase());
+            Ok(out)
+        })
+    }
+
+    fn custom_rules(&self, name: String) -> std::result::Result<Vec<String>, String> {
+        let t = self.target(&name)?;
+        Ok(odrs_engine::filter::custom_rules(&Self::sync_list_text(&t)?))
+    }
+
+    fn set_selection(&self, name: String, choices: Vec<FolderChoice>, delete_local: bool) -> std::result::Result<(), String> {
+        let t = self.target(&name)?;
+        let file = t.opts.sync_list_file.clone().ok_or("this drive has no selective sync file")?;
+        let choices: Vec<odrs_engine::filter::FolderChoice> = choices
+            .into_iter()
+            .map(|c| odrs_engine::filter::FolderChoice { path: c.path, included: c.included, mixed: c.mixed, expanded: c.expanded })
+            .collect();
+        let rules = odrs_engine::filter::selection_rules(&Self::sync_list_text(&t)?, &choices).map_err(|e| e.to_string())?;
+        match &rules {
+            Some(text) => {
+                // Like the client for Windows: files at the top of the drive stay synced.
+                if !t.opts.filters.sync_root_files {
+                    let section = (name != "main").then_some(name.as_str());
+                    config::set_value(&self.config_path, section, "sync_root_files", "true").map_err(|e| e.to_string())?;
+                }
+                let tmp = file.with_extension("tmp");
+                std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &file)).map_err(|e| format!("{}: {e}", file.display()))?;
+            }
+            None => match std::fs::remove_file(&file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("{}: {e}", file.display())),
+                _ => {}
+            },
+        }
+        let mut drives = self.drives.lock().unwrap();
+        if let Some(t) = drives.targets.iter_mut().find(|t| t.name == name) {
+            t.opts.filters.sync_root_files |= rules.is_some();
+        }
+        if delete_local {
+            drives.delete_excluded.insert(name.clone());
+        } else {
+            drives.delete_excluded.remove(&name);
+        }
+        tracing::info!(drive = %name, selective = rules.is_some(), delete_local, "folder selection changed");
+        Ok(())
     }
 }
 

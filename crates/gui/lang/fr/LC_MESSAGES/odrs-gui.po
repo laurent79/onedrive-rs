@@ -276,3 +276,29 @@ msgstr "La première synchronisation est terminée."
 
 msgid "All files are intact."
 msgstr "Tous les fichiers sont intacts."
+
+msgid "Choose the folders to synchronise"
+msgstr "Choisir les dossiers à synchroniser"
+
+msgid "Choose folders — {}"
+msgstr "Choix des dossiers — {}"
+
+msgid "Choose the folders of “{}” to synchronise on this computer."
+msgstr "Choisissez les dossiers de « {} » à synchroniser sur cet ordinateur."
+
+msgid "Files directly at the top of the drive are always synchronised. A folder no longer synchronised keeps its local copy, unless you tick the box below; files changed locally are kept in any case."
+msgstr "Les fichiers placés directement à la racine sont toujours synchronisés. Un dossier qui n'est plus synchronisé garde sa copie locale, sauf si vous cochez la case ci-dessous ; les fichiers modifiés localement sont gardés dans tous les cas."
+
+msgid "{n} rule written by hand in the sync_list file is kept as is."
+msgid_plural "{n} rules written by hand in the sync_list file are kept as they are."
+msgstr[0] "{n} règle écrite à la main dans le fichier sync_list est conservée telle quelle."
+msgstr[1] "{n} règles écrites à la main dans le fichier sync_list sont conservées telles quelles."
+
+msgid "Also delete the local copy of removed folders"
+msgstr "Supprimer aussi la copie locale des dossiers retirés"
+
+msgid "Select at least one folder."
+msgstr "Sélectionnez au moins un dossier."
+
+msgid "Save"
+msgstr "Enregistrer"

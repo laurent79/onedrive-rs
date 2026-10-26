@@ -206,6 +206,145 @@ impl SyncList {
     fn canonical(&self) -> String {
         self.rules.iter().map(|r| format!("{r:?}\n")).collect()
     }
+
+    /// How a folder chooser shows `rel` (a folder): synced or not, and whether
+    /// a rule targets something below it, so that what is inside differs.
+    /// Rules without a leading `/` apply anywhere and are left out of `mixed`.
+    pub fn folder_state(list: Option<&Self>, rel: &str) -> FolderState {
+        let Some(list) = list else { return FolderState { included: true, mixed: false } };
+        let path: Vec<Vec<char>> = rel.split('/').filter(|s| !s.is_empty()).map(|s| s.to_lowercase().chars().collect()).collect();
+        let excluded = list.rules.iter().any(|r| r.exclude && r.covers(&path, true));
+        let included = !excluded && list.rules.iter().any(|r| !r.exclude && r.covers(&path, true));
+        let mixed = list.rules.iter().any(|r| r.anchored && r.exclude == included && prefix_match(&r.segments, &path));
+        FolderState { included, mixed }
+    }
+}
+
+/// See [`SyncList::folder_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderState {
+    pub included: bool,
+    pub mixed: bool,
+}
+
+/// A folder as left by the user in a folder chooser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderChoice {
+    /// Relative to the sync folder, `/`-separated.
+    pub path: String,
+    /// Its files and the folders not listed below it are synced.
+    pub included: bool,
+    /// Unchanged since [`SyncList::folder_state`] said something below it differs.
+    pub mixed: bool,
+    /// Its subfolders were listed (and are among the choices).
+    pub expanded: bool,
+}
+
+/// Rules of a `sync_list` a folder chooser cannot show (kept as written).
+pub fn custom_rules(text: &str) -> Vec<String> {
+    split_rules(text).1
+}
+
+/// (simple rules: `/path` or `!/path` as (exclusion, path, line); the others).
+#[allow(clippy::type_complexity)]
+fn split_rules(text: &str) -> (Vec<(bool, String, String)>, Vec<String>) {
+    let mut simple = Vec::new();
+    let mut custom = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let (exclude, rest) = match line.strip_prefix(['!', '-']) {
+            Some(rest) => (true, rest.trim_start()),
+            None => (false, line),
+        };
+        if rest.starts_with('/') && !rest.contains(['*', '?']) {
+            simple.push((exclude, rest.trim_matches('/').to_owned(), line.to_owned()));
+        } else {
+            custom.push(line.to_owned());
+        }
+    }
+    (simple, custom)
+}
+
+/// Folder choices and the simple rules (`/path` or `!/path`) of the previous file.
+struct Chosen<'a> {
+    choices: &'a [FolderChoice],
+    /// (exclusion, path without slashes, line as written)
+    simple: &'a [(bool, String, String)],
+}
+
+impl<'a> Chosen<'a> {
+    fn children(&self, dir: &'a str) -> impl Iterator<Item = &'a FolderChoice> + use<'a> {
+        self.choices.iter().filter(move |c| c.path.rsplit_once('/').map_or("", |(p, _)| p) == dir)
+    }
+
+    /// Previous rules kept below a folder the user neither opened nor changed.
+    fn kept(&self, c: &FolderChoice) -> Vec<&'a (bool, String, String)> {
+        if c.expanded || !c.mixed {
+            return Vec::new();
+        }
+        self.simple.iter().filter(|(_, p, _)| is_below(p, &c.path)).collect()
+    }
+
+    fn walk(&self, c: &'a FolderChoice, parent_synced: bool, out: &mut Vec<String>) {
+        let kept = self.kept(c);
+        let includes_below = self.choices.iter().any(|d| d.included && is_below(&d.path, &c.path)) || kept.iter().any(|(exclude, ..)| !exclude);
+        // An exclusion always wins: a folder holding something included is
+        // synced, with exclusions for the rest (its own files stay synced).
+        let synced = c.included || (parent_synced && includes_below);
+        if synced != parent_synced {
+            out.push(if synced { format!("/{}/", c.path) } else { format!("!/{}/", c.path) });
+        }
+        out.extend(kept.into_iter().map(|(.., line)| line.clone()));
+        for child in self.children(&c.path) {
+            self.walk(child, synced, out);
+        }
+    }
+}
+
+/// `path` is strictly inside the folder `dir`.
+fn is_below(path: &str, dir: &str) -> bool {
+    path.len() > dir.len() && path.starts_with(dir) && path.as_bytes()[dir.len()] == b'/'
+}
+
+/// No folder is selected: that would sync nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("no folder is selected")]
+pub struct NothingSelected;
+
+/// Write a `sync_list` for the folders chosen in a folder chooser (the top
+/// level being listed). `previous` is the current file: its rules for folders
+/// that were not expanded are kept, as are rules a chooser cannot show
+/// (wildcards, rules without a leading `/`). `None`: everything is selected,
+/// no selective sync is needed.
+pub fn selection_rules(previous: &str, choices: &[FolderChoice]) -> Result<Option<String>, NothingSelected> {
+    let (simple, custom) = split_rules(previous);
+    let chosen = Chosen { choices, simple: &simple };
+    let mut rules = Vec::new();
+    for top in chosen.children("") {
+        chosen.walk(top, false, &mut rules);
+    }
+    let everything = chosen.children("").all(|c| c.included) && !rules.iter().any(|r| r.starts_with('!')) && custom.is_empty();
+    if everything {
+        return Ok(None);
+    }
+    if !rules.iter().chain(&custom).any(|r| !r.starts_with(['!', '-'])) {
+        return Err(NothingSelected);
+    }
+    let mut text = String::from("# Folders chosen in onedrive-rs (files at the top are synced as well: sync_root_files)\n");
+    for r in rules {
+        text.push_str(&r);
+        text.push('\n');
+    }
+    if !custom.is_empty() {
+        text.push_str("# Other rules, kept as written\n");
+        for r in custom {
+            text.push_str(&r);
+            text.push('\n');
+        }
+    }
+    Ok(Some(text))
 }
 
 impl Rule {
@@ -391,6 +530,63 @@ mod tests {
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint(), Filters { sync_list: Some(list("# same\n/A")), ..Default::default() }.fingerprint());
         assert_ne!(Filters::default().fingerprint(), Filters { skip_dotfiles: true, ..Default::default() }.fingerprint());
+    }
+
+    fn choice(path: &str, included: bool, mixed: bool, expanded: bool) -> FolderChoice {
+        FolderChoice { path: path.into(), included, mixed, expanded }
+    }
+
+    #[test]
+    fn folder_states() {
+        assert_eq!(SyncList::folder_state(None, "Any"), FolderState { included: true, mixed: false });
+        let l = list("/Documents\n!/Documents/Old\n/Teams/Engineering/\n!node_modules/\n");
+        let state = |rel| SyncList::folder_state(Some(&l), rel);
+        assert_eq!(state("Documents"), FolderState { included: true, mixed: true });
+        assert_eq!(state("Documents/Old"), FolderState { included: false, mixed: false });
+        assert_eq!(state("Documents/New"), FolderState { included: true, mixed: false });
+        assert_eq!(state("Teams"), FolderState { included: false, mixed: true });
+        assert_eq!(state("Teams/Engineering"), FolderState { included: true, mixed: false });
+        assert_eq!(state("Pictures"), FolderState { included: false, mixed: false });
+    }
+
+    #[test]
+    fn rules_from_choices() {
+        // Top level listed, Teams opened.
+        let choices = [
+            choice("Documents", true, false, false),
+            choice("Pictures", false, false, false),
+            choice("Teams", false, false, true),
+            choice("Teams/Engineering", true, false, false),
+            choice("Teams/Sales", false, false, false),
+        ];
+        let text = selection_rules("", &choices).unwrap().unwrap();
+        let rules: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(rules, ["/Documents/", "/Teams/Engineering/"]);
+
+        // A folder kept with its files, without one subfolder.
+        let choices = [choice("Documents", true, false, true), choice("Documents/Old", false, false, false), choice("Music", true, false, false)];
+        let text = selection_rules("", &choices).unwrap().unwrap();
+        let l = list(&text);
+        assert!(!l.excludes("Documents/a.txt", false) && l.excludes("Documents/Old/a.txt", false));
+        assert!(!l.excludes("Music/a.mp3", false));
+
+        // Everything selected: no selective sync. Nothing: refused.
+        assert_eq!(selection_rules("/Old\n", &[choice("A", true, false, false), choice("B", true, false, false)]), Ok(None));
+        assert_eq!(selection_rules("", &[choice("A", false, false, false)]), Err(NothingSelected));
+    }
+
+    #[test]
+    fn rules_kept_for_unopened_folders() {
+        let previous = "/Teams/Engineering/\n!/Teams/Engineering/build/\n/Documents/\n!*.tmp\nnotes.txt\n";
+        // Teams not opened: its rules stay; Documents unchecked; a custom rule stays.
+        let choices = [choice("Teams", false, true, false), choice("Documents", false, false, false), choice("Music", true, false, false)];
+        let text = selection_rules(previous, &choices).unwrap().unwrap();
+        let rules: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(rules, ["/Teams/Engineering/", "!/Teams/Engineering/build/", "/Music/", "!*.tmp", "notes.txt"]);
+        // Teams toggled (no longer mixed): its old rules go.
+        let choices = [choice("Teams", true, false, false), choice("Documents", false, false, false)];
+        let text = selection_rules(previous, &choices).unwrap().unwrap();
+        assert!(!text.contains("Engineering") && text.contains("/Teams/\n"));
     }
 
     #[test]

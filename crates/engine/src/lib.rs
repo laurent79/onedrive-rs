@@ -88,6 +88,9 @@ pub struct SyncOptions {
     /// Where the filters of each drive's previous pass are remembered, to
     /// notice a change; `None`: filter changes are not handled.
     pub filter_state: Option<PathBuf>,
+    /// When the filters changed, also delete the local copies of what they
+    /// now exclude (files unchanged since their sync only).
+    pub delete_excluded: bool,
 }
 
 impl SyncOptions {
@@ -105,6 +108,7 @@ impl SyncOptions {
             upload_sessions: None,
             sync_list_file: None,
             filter_state: None,
+            delete_excluded: false,
         }
     }
 }

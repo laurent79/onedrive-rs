@@ -8,7 +8,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use odrs_gui::{DriveRow, MainWindow, ReportWindow, ResyncWindow, Status};
+use odrs_gui::{DriveRow, FolderRow, FoldersWindow, MainWindow, ReportWindow, ResyncWindow, Status};
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
 fn snapshot(window: &slint::Window, out: String) {
@@ -46,6 +46,34 @@ fn main() {
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
             slint::run_event_loop().unwrap();
         }
+        "folders" => {
+            let w = FoldersWindow::new().unwrap();
+            w.set_drive_title("OneDrive".into());
+            let row = |path: &str, depth, check, expanded, has_children| FolderRow {
+                path: path.into(),
+                name: path.rsplit('/').next().unwrap().into(),
+                depth,
+                check,
+                expanded,
+                has_children,
+                loading: false,
+            };
+            let rows = vec![
+                row("Documents", 0, 2, true, true),
+                row("Documents/Invoices", 1, 1, false, false),
+                row("Documents/Old", 1, 0, false, true),
+                row("Music", 0, 1, false, true),
+                row("Pictures", 0, 0, false, true),
+                row("Teams", 0, 2, false, true),
+            ];
+            w.set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+            w.set_custom_rules(2);
+            w.set_delete_local(true);
+            w.show().unwrap();
+            let weak = w.as_weak();
+            slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
+            slint::run_event_loop().unwrap();
+        }
         "main" => {
             let w = MainWindow::new().unwrap();
             w.set_status(Status { state: "syncing".into(), account: "someone@example.com".into(), ..Default::default() });
@@ -75,6 +103,6 @@ fn main() {
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
             slint::run_event_loop().unwrap();
         }
-        other => panic!("unknown window {other:?} (main, resync, report)"),
+        other => panic!("unknown window {other:?} (main, resync, report, folders)"),
     }
 }
