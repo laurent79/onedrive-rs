@@ -65,10 +65,10 @@ pub async fn run(paths: &Paths, auth: AuthConfig, from: PathBuf, name: Option<St
         eprintln!("Previous database kept as {}", backup.display());
     }
     std::fs::rename(&staging, &ours)?;
-    config::set_value(&paths.config(), None, "sync_dir", &sync_dir.display().to_string())?;
+    config::set_value(&paths.config(), None, "sync_dir", sync_dir.display().to_string())?;
     // The imported database reflects D's filters: keep them.
     for (key, value) in d_cfg.filters.entries() {
-        config::set_value(&paths.config(), None, key, &value)?;
+        config::set_value(&paths.config(), None, key, value.clone())?;
         eprintln!("{key} = \"{value}\" taken from the D configuration");
     }
     import_sync_list(&from, &config::sync_list_path(&paths.config_dir, "main"))?;

@@ -249,9 +249,11 @@ pub fn append_drive_section(path: &Path, d: &DriveConfig) -> Result<()> {
 }
 
 /// Set `key = "value"` at the top level (`section` None) or in the
-/// `[drive "name"]` section of a config file: replace the key, or add it at
-/// the end of its part of the file (top-level keys before the first section).
-pub fn set_value(path: &Path, section: Option<&str>, key: &str, value: &str) -> Result<()> {
+/// `[drive "name"]` section of a config file: replace the key (other lines of
+/// a repeated key go), or add it at the end of its part of the file
+/// (top-level keys before the first section). `None` removes the key.
+pub fn set_value(path: &Path, section: Option<&str>, key: &str, value: impl Into<Option<String>>) -> Result<()> {
+    let value: Option<String> = value.into();
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let header = |l: &str| l.trim_start().starts_with('[');
@@ -263,15 +265,22 @@ pub fn set_value(path: &Path, section: Option<&str>, key: &str, value: &str) -> 
             (at + 1, lines[at + 1..].iter().position(|l| header(l)).map_or(lines.len(), |n| at + 1 + n))
         }
     };
-    let line = format!("{key} = \"{value}\"");
-    match (start..end).find(|&i| lines[i].trim_start().split('=').next().is_some_and(|k| k.trim() == key)) {
-        Some(i) => lines[i] = line,
-        None => {
-            let mut at = end;
-            while at > start && lines[at - 1].trim().is_empty() {
-                at -= 1;
+    let is_key = |l: &str| !l.trim_start().starts_with('#') && l.split_once('=').is_some_and(|(k, _)| k.trim() == key);
+    let found: Vec<usize> = (start..end).filter(|&i| is_key(&lines[i])).collect();
+    for &i in found.iter().skip(usize::from(value.is_some())).rev() {
+        lines.remove(i);
+    }
+    if let Some(value) = value {
+        let line = format!("{key} = \"{value}\"");
+        match found.first() {
+            Some(&i) => lines[i] = line,
+            None => {
+                let mut at = end;
+                while at > start && lines[at - 1].trim().is_empty() {
+                    at -= 1;
+                }
+                lines.insert(at, line);
             }
-            lines.insert(at, line);
         }
     }
     if let Some(dir) = path.parent() {
@@ -405,20 +414,26 @@ mod tests {
     fn values_are_replaced_or_added() {
         let p = std::env::temp_dir().join(format!("odrs-cfg-test-{}", std::process::id()));
         std::fs::write(&p, "# mine\nthreads = \"4\"\nsync_dir = \"/old\"\n").unwrap();
-        set_value(&p, None, "sync_dir", "/new").unwrap();
+        set_value(&p, None, "sync_dir", "/new".to_owned()).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "# mine\nthreads = \"4\"\nsync_dir = \"/new\"\n");
         std::fs::write(&p, "threads = \"4\"\n").unwrap();
-        set_value(&p, None, "sync_dir", "/x").unwrap();
+        set_value(&p, None, "sync_dir", "/x".to_owned()).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "threads = \"4\"\nsync_dir = \"/x\"\n");
         std::fs::write(&p, "threads = \"4\"\n\n[drive \"L\"]\nsync_dir = \"/l\"\n\n[drive \"M\"]\nsync_dir = \"/m\"\n").unwrap();
-        set_value(&p, None, "sync_dir", "/x").unwrap();
-        set_value(&p, Some("L"), "sync_root_files", "true").unwrap();
-        set_value(&p, Some("M"), "sync_dir", "/n").unwrap();
+        set_value(&p, None, "sync_dir", "/x".to_owned()).unwrap();
+        set_value(&p, Some("L"), "sync_root_files", "true".to_owned()).unwrap();
+        set_value(&p, Some("M"), "sync_dir", "/n".to_owned()).unwrap();
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             "threads = \"4\"\nsync_dir = \"/x\"\n\n[drive \"L\"]\nsync_dir = \"/l\"\nsync_root_files = \"true\"\n\n[drive \"M\"]\nsync_dir = \"/n\"\n"
         );
-        assert!(set_value(&p, Some("Nope"), "a", "b").is_err());
+        assert!(set_value(&p, Some("Nope"), "a", "b".to_owned()).is_err());
+        // A repeated key becomes one line; None removes it.
+        std::fs::write(&p, "skip_dir = \"a\"\nthreads = \"4\"\nskip_dir = \"b\"\n").unwrap();
+        set_value(&p, None, "skip_dir", "c".to_owned()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "skip_dir = \"c\"\nthreads = \"4\"\n");
+        set_value(&p, None, "skip_dir", None).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "threads = \"4\"\n");
         std::fs::remove_file(&p).unwrap();
     }
 

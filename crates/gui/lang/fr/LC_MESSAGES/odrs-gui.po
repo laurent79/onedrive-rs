@@ -378,3 +378,51 @@ msgstr "Garder la version en ligne"
 
 msgid "Retry"
 msgstr "Réessayer"
+
+msgid "Paused: not synchronised until you resume it"
+msgstr "En pause : pas synchronisé jusqu'à la reprise"
+
+msgid "Resume syncing this drive"
+msgstr "Reprendre la synchronisation de ce drive"
+
+msgid "Pause this drive only"
+msgstr "Mettre en pause ce drive seulement"
+
+msgid "Settings"
+msgstr "Réglages"
+
+msgid "Synchronisation"
+msgstr "Synchronisation"
+
+msgid "Check every drive every"
+msgstr "Vérifier tous les drives toutes les"
+
+msgid "minutes"
+msgstr "minutes"
+
+msgid "Changes are picked up as they happen, locally and online: this full check only catches what was missed."
+msgstr "Les changements sont pris en compte dès qu'ils se produisent, ici et en ligne : cette vérification complète ne rattrape que ce qui aurait été manqué."
+
+msgid "Not synchronised"
+msgstr "Non synchronisés"
+
+msgid "Files (patterns separated by |, e.g. *.bak|*.iso)"
+msgstr "Fichiers (motifs séparés par |, par exemple *.bak|*.iso)"
+
+msgid "Always ignored as well: ~*, .~*, *.tmp, *.swp, *.partial"
+msgstr "Toujours ignorés en plus : ~*, .~*, *.tmp, *.swp, *.partial"
+
+msgid "Folders (a name anywhere, or a path such as Documents/Old)"
+msgstr "Dossiers (un nom, où qu'il soit, ou un chemin comme Documents/Ancien)"
+
+msgid "Hidden files and folders (names starting with a dot)"
+msgstr "Fichiers et dossiers cachés (noms commençant par un point)"
+
+msgid "Items no longer synchronised keep their local copy; newly included ones are downloaded."
+msgstr "Les éléments qui ne sont plus synchronisés gardent leur copie locale ; ceux qui le redeviennent sont téléchargés."
+
+msgid "Desktop"
+msgstr "Bureau"
+
+msgid "Show the OneDrive icon when the session starts"
+msgstr "Afficher l'icône OneDrive à l'ouverture de session"

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use odrs_ipc::{
-    BoxFuture, Command, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, Library, Progress, Server, Site, State, VerifyFinding,
-    VerifyStatus,
+    BoxFuture, Command, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, Library, Progress, Server, Settings, Site, State,
+    VerifyFinding, VerifyStatus,
 };
 use tokio::sync::mpsc;
 
@@ -32,6 +32,7 @@ async fn main() -> odrs_ipc::Result<()> {
                     progress = Progress::default();
                     server.set_state(State::Syncing).await?;
                 }
+                Some(Command::Refresh) => {}
                 None => return Ok(()),
             },
             _ = tokio::time::sleep(Duration::from_millis(500)), if paused => {
@@ -78,6 +79,7 @@ struct Mock {
     verifications: Mutex<Vec<VerifyStatus>>,
     /// Folders left unchecked by the last SetSelection.
     excluded: Mutex<Vec<String>>,
+    settings: Mutex<Settings>,
 }
 
 /// Subfolders of the fake drives.
@@ -239,6 +241,21 @@ impl DriveManager for Mock {
 
     fn custom_rules(&self, name: String) -> Result<Vec<String>, String> {
         Ok(if name == "main" { vec!["!*.tmp".into()] } else { Vec::new() })
+    }
+
+    fn settings(&self) -> Result<Settings, String> {
+        Ok(self.settings.lock().unwrap().clone())
+    }
+
+    fn set_settings(&self, settings: Settings) -> Result<(), String> {
+        println!("settings: {settings:?}");
+        *self.settings.lock().unwrap() = settings;
+        Ok(())
+    }
+
+    fn pause_drive(&self, name: String, paused: bool) -> Result<(), String> {
+        println!("drive {name} paused: {paused}");
+        Ok(())
     }
 
     fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> Result<(), String> {

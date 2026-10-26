@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
-use odrs_ipc::{Client, DriveStatus, Event, FolderChoice, Snapshot, VerifyFinding, VerifyStatus};
+use odrs_ipc::{Client, DriveStatus, Event, FolderChoice, Settings, Snapshot, VerifyFinding, VerifyStatus};
 use slint::{ComponentHandle as _, Model as _, ModelRc, SharedString, StandardListViewItem, VecModel};
 use tokio::sync::mpsc;
 
@@ -63,6 +63,9 @@ enum UiCommand {
     CustomRules(String),
     SetSelection { drive: String, choices: Vec<FolderChoice>, delete_local: bool },
     ResolveConflict { drive: String, backup: String, keep_local: bool },
+    LoadSettings,
+    SaveSettings { settings: Settings, autostart: bool },
+    PauseDrive { name: String, paused: bool },
 }
 
 /// Run the UI on the current thread until the user quits from the tray menu.
@@ -122,6 +125,7 @@ struct Ui {
     folders: Option<FoldersWindow>,
     activity: Option<ActivityWindow>,
     problems: Option<ProblemsWindow>,
+    settings: Option<SettingsWindow>,
     /// Latest daemon state, for a main window opened later.
     status: Status,
     /// Latest drive statuses, for the "to resolve" window.
@@ -304,6 +308,63 @@ fn problems_window() -> Option<ProblemsWindow> {
     )
 }
 
+fn settings_window() -> Option<SettingsWindow> {
+    lazy(
+        |u| &mut u.settings,
+        |ctx| {
+            let w = SettingsWindow::new()?;
+            let (s, t) = (w.as_weak(), ctx.tx.clone());
+            w.on_save(move || {
+                let Some(s) = s.upgrade() else { return };
+                s.set_busy(true);
+                s.set_message(SharedString::new());
+                let settings = Settings {
+                    interval_secs: u64::try_from(s.get_interval_mins().max(1)).unwrap_or(5) * 60,
+                    skip_file: s.get_skip_file().trim().to_owned(),
+                    skip_dir: s.get_skip_dir().trim().to_owned(),
+                    skip_dotfiles: s.get_skip_dotfiles(),
+                };
+                let _ = t.send(UiCommand::SaveSettings { settings, autostart: s.get_autostart() });
+            });
+            let s = w.as_weak();
+            w.on_cancel(move || {
+                if let Some(s) = s.upgrade() {
+                    let _ = s.hide();
+                }
+            });
+            Ok(w)
+        },
+    )
+}
+
+fn existing_settings() -> Option<SettingsWindow> {
+    existing(|u| &u.settings)
+}
+
+/// The session autostart entry (as `contrib/install.sh --autostart` installs it).
+fn autostart_file() -> Option<std::path::PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(config.join("autostart").join(format!("{APP_ID}.desktop")))
+}
+
+/// Start the tray icon with the desktop session, or not.
+fn set_autostart(on: bool) -> std::io::Result<()> {
+    let Some(file) = autostart_file() else { return Ok(()) };
+    match (on, file.exists()) {
+        (true, false) => {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&file, include_str!("../../../contrib/desktop/io.github.onedrive_rs-autostart.desktop"))
+        }
+        (false, true) => std::fs::remove_file(&file),
+        _ => Ok(()),
+    }
+}
+
 /// Show the conflicts, then the failed items, of the window's drive.
 fn refresh_problems(w: &ProblemsWindow) {
     let drive = w.get_drive_name();
@@ -437,6 +498,18 @@ fn wire_logic(logic: &Logic<'_>, ctx: &Rc<Ctx>) {
             let _ = w.show();
         }
     });
+    let c = ctx.clone();
+    logic.on_show_settings(move || {
+        if let Some(w) = settings_window() {
+            w.set_busy(true);
+            w.set_message(SharedString::new());
+            w.set_autostart(autostart_file().is_some_and(|f| f.exists()));
+            let _ = w.show();
+            c.send(UiCommand::LoadSettings);
+        }
+    });
+    let c = ctx.clone();
+    logic.on_pause_drive(move |name, paused| c.send(UiCommand::PauseDrive { name: name.into(), paused }));
     logic.on_show_activity(|| {
         if let Some(w) = activity_window() {
             w.set_current(-1);
@@ -934,6 +1007,37 @@ async fn handle(client: &Client, cmd: UiCommand, last: Option<&Snapshot>) {
                 }
             });
         }
+        UiCommand::LoadSettings => {
+            let result = d.settings().await;
+            in_ui(existing_settings, move |w| {
+                w.set_busy(false);
+                match result {
+                    Ok(s) => {
+                        w.set_interval_mins(i32::try_from(s.interval_secs.div_ceil(60)).unwrap_or(5));
+                        w.set_skip_file(s.skip_file.into());
+                        w.set_skip_dir(s.skip_dir.into());
+                        w.set_skip_dotfiles(s.skip_dotfiles);
+                    }
+                    Err(e) => w.set_message(daemon_message(&e).into()),
+                }
+            });
+        }
+        UiCommand::SaveSettings { settings, autostart } => {
+            let saved = match set_autostart(autostart) {
+                Ok(()) => d.set_settings(&settings).await.map_err(|e| daemon_message(&e)),
+                Err(e) => Err(e.to_string()),
+            };
+            in_ui(existing_settings, move |w| {
+                w.set_busy(false);
+                match saved {
+                    Ok(()) => {
+                        let _ = w.hide();
+                    }
+                    Err(e) => w.set_message(e.into()),
+                }
+            });
+        }
+        UiCommand::PauseDrive { name, paused } => report(d.pause_drive(&name, paused).await, "pause drive"),
         UiCommand::CustomRules(drive) => {
             let n = d.custom_rules(&drive).await.map_or(0, |r| r.len());
             in_ui(existing_folders, move |f| {

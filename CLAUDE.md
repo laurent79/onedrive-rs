@@ -117,6 +117,12 @@ Toujours vérifier le comportement du client D avant de réinventer un cas parti
   backup, keep_local)` : garder la version locale (la copie remplace le fichier, envoyée ensuite) ou en ligne (la copie
   part) ; la version écartée va dans la corbeille du bureau (`app/src/trash.rs`, spécification freedesktop, jamais
   supprimée). GUI : ligne « N conflits à résoudre » + « Résoudre… » sur la carte → fenêtre « À résoudre ».
+- Réglages (D-Bus `Settings`/`SetSettings`, fenêtre GUI) : `monitor_interval` (≥ 60 s) et filtres globaux
+  (`skip_file`, `skip_dir`, `skip_dotfiles`) écrits dans `config` (`config::set_value` : clé répétée → une ligne,
+  `None` la retire), relus et appliqués aux cibles sans redémarrage (changement de filtre → `selective.rs`). Case
+  « icône à l'ouverture de session » : la GUI écrit/retire `~/.config/autostart/io.github.onedrive_rs.desktop`.
+  Pause d'un seul drive (`PauseDrive`, icône de la carte) : `<config>/paused_drives`, drive sauté par les passes
+  (vérifié avant chaque drive, y compris pendant une passe en cours), état `paused`.
 - Vérification d'intégrité (`odrs_engine::verify`, CLI `verify` et D-Bus `Verify`/`CancelVerify`/`VerifyReport`,
   propriété `Verifications`) : lecture seule, un drive à la fois à côté des passes (2 threads, connexion SQLite
   propre) ; écarts revérifiés à la fin (ligne DB changée = la synchro est passée par là → ignoré). Dernier

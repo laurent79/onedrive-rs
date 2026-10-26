@@ -12,7 +12,7 @@ use odrs_engine::{Stats, SyncMode};
 use odrs_graph::{AuthConfig, Graph};
 use odrs_ipc::{
     AUTH_ERROR_PREFIX, BoxFuture, Command, Conflict, DriveManager, DriveStatus, Event, Folder, FolderChoice, Info, ItemFailure, Library,
-    OFFLINE_ERROR_PREFIX, Progress, Server, Site, State, VerifyFinding,
+    OFFLINE_ERROR_PREFIX, Progress, Server, Settings, Site, State, VerifyFinding,
 };
 use odrs_store::Store;
 use tokio::signal::unix::{SignalKind, signal};
@@ -23,6 +23,8 @@ use crate::verifier::Verifier;
 use crate::{Paths, Target};
 
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+/// Shortest interval between two passes over every drive, from the settings.
+const MIN_INTERVAL_SECS: u64 = 60;
 /// Retry delay after a pass failed for lack of network.
 const OFFLINE_RETRY: Duration = Duration::from_secs(60);
 /// Quiet time after a local change before starting a pass.
@@ -43,6 +45,8 @@ pub(crate) struct Drives {
     /// Drives whose new folder selection also deletes the local copies of
     /// what is no longer synced (names), until a pass of the drive succeeds.
     delete_excluded: HashSet<String>,
+    /// Drives not synced until resumed (names), kept in `paused_drives` (config dir).
+    paused: HashSet<String>,
     /// Bumped on every change, so the loop knows to rebuild its watchers.
     version: u64,
 }
@@ -61,14 +65,26 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             String::new()
         }
     };
-    let drives =
-        Arc::new(Mutex::new(Drives { targets, removed: Vec::new(), resync: Vec::new(), delete_excluded: HashSet::new(), version: 0 }));
+    let paused_file = paths.config_dir.join("paused_drives");
+    let paused_drives: HashSet<String> =
+        std::fs::read_to_string(&paused_file).unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+    let drives = Arc::new(Mutex::new(Drives {
+        targets,
+        removed: Vec::new(),
+        resync: Vec::new(),
+        delete_excluded: HashSet::new(),
+        paused: paused_drives,
+        version: 0,
+    }));
+    let interval = Arc::new(AtomicU64::new(interval.as_secs()));
     let verifier = Verifier::new(paths.db(), paths.config_dir.join("verify.json"), drives.clone());
     let realtime = cfg.disable_websocket_support != Some(true);
     let manager = Arc::new(Manager {
         graph: graph.clone(),
         config_path: paths.config(),
-        cfg,
+        paused_file,
+        cfg: Mutex::new(cfg),
+        interval: interval.clone(),
         drives: drives.clone(),
         verifier: verifier.clone(),
     });
@@ -147,6 +163,18 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             server.set_drives(statuses.clone()).await?;
             watched_version = Some(version);
         }
+        let paused_drives = drives.lock().unwrap().paused.clone();
+        let mut pause_changed = false;
+        for s in &mut statuses {
+            let paused = paused_drives.contains(&s.name);
+            if paused != (s.state == "paused") {
+                s.state = if paused { "paused" } else { "pending" }.into();
+                pause_changed = true;
+            }
+        }
+        if pause_changed {
+            server.set_drives(statuses.clone()).await?;
+        }
 
         // Wait for the next pass, a command or a shutdown signal.
         let wake = tokio::time::sleep_until(remote_next.map_or(next, |r| r.min(next)).into());
@@ -177,6 +205,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
                         paused = true;
                         server.set_state(State::Paused).await?;
                     }
+                    Some(Command::Refresh) => {}
                     Some(Command::Resume) if paused => {
                         paused = false;
                         next = Instant::now();
@@ -220,7 +249,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
         let mut sync_requested = false;
         let library_ids = libraries(&targets);
         let outcome = tokio::select! {
-            r = run_pass(&graph, &store, selected(&targets, only.as_ref()), &library_ids, mode, Outputs { server: &server, statuses: &shared, events: &events }) => Some(r),
+            r = run_pass(&graph, &store, selected(&targets, only.as_ref(), &paused_drives), &library_ids, mode, Outputs { server: &server, statuses: &shared, events: &events, drives: &drives }) => Some(r),
             () = until_pause(&mut rx, &mut sync_requested) => None,
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -275,7 +304,7 @@ pub async fn run(paths: &Paths, auth: AuthConfig, cfg: Config, targets: Vec<Targ
             }
         }
         if full {
-            next = Instant::now() + interval;
+            next = Instant::now() + Duration::from_secs(interval.load(Ordering::Relaxed));
         }
         if outcome.deferred > 0 {
             // Files that were still being written: pick them up shortly.
@@ -365,8 +394,8 @@ struct PassOutcome {
 }
 
 /// The drives of a pass with their index in the statuses: all, or `only` those.
-fn selected<'a>(targets: &'a [Target], only: Option<&HashSet<String>>) -> Vec<(usize, &'a Target)> {
-    targets.iter().enumerate().filter(|(_, t)| only.is_none_or(|o| o.contains(&t.name))).collect()
+fn selected<'a>(targets: &'a [Target], only: Option<&HashSet<String>>, paused: &HashSet<String>) -> Vec<(usize, &'a Target)> {
+    targets.iter().enumerate().filter(|(_, t)| only.is_none_or(|o| o.contains(&t.name)) && !paused.contains(&t.name)).collect()
 }
 
 /// One pass over every drive, in order; a failing drive does not stop the
@@ -379,9 +408,12 @@ async fn run_pass(
     mode: SyncMode,
     out_to: Outputs<'_>,
 ) -> PassOutcome {
-    let Outputs { server, statuses, events } = out_to;
+    let Outputs { server, statuses, events, drives } = out_to;
     let mut out = PassOutcome { failures: Vec::new(), total: Progress::default(), deferred: 0 };
     for (i, t) in targets {
+        if drives.lock().unwrap().paused.contains(&t.name) {
+            continue;
+        }
         let stats = Arc::new(Stats::default());
         let started = Instant::now();
         set_status(statuses, i, |s| {
@@ -463,6 +495,8 @@ struct Outputs<'a> {
     /// Updated live.
     statuses: &'a Arc<Mutex<Vec<DriveStatus>>>,
     events: &'a Arc<Events>,
+    /// For drives paused while the pass runs: skipped if not started yet.
+    drives: &'a Arc<Mutex<Drives>>,
 }
 
 /// Library drive ids, to tell the main drive apart in the database.
@@ -651,8 +685,11 @@ pub(crate) fn now_rfc3339() -> String {
 struct Manager {
     graph: Arc<Graph>,
     config_path: PathBuf,
+    paused_file: PathBuf,
     /// Global options (filters, permissions...) applied to new drives.
-    cfg: Config,
+    cfg: Mutex<Config>,
+    /// Seconds between two passes over every drive.
+    interval: Arc<AtomicU64>,
     drives: Arc<Mutex<Drives>>,
     verifier: Verifier,
 }
@@ -712,7 +749,7 @@ impl DriveManager for Manager {
         config::validate_new_drive(&current, &main_dir, &name, &drive_id, &sync_dir).map_err(|e| e.to_string())?;
         let d = DriveConfig { name: name.clone(), drive_id: drive_id.clone(), sync_dir: sync_dir.clone(), ..Default::default() };
         config::append_drive_section(&self.config_path, &d).map_err(|e| e.to_string())?;
-        let mut opts = self.cfg.sync_options(sync_dir, Some(&d));
+        let mut opts = self.cfg.lock().unwrap().sync_options(sync_dir, Some(&d));
         opts.drive_id = Some(drive_id);
         if let Some(main) = drives.targets.first() {
             opts.max_transfers = main.opts.max_transfers;
@@ -738,6 +775,7 @@ impl DriveManager for Manager {
         };
         config::remove_drive_section(&self.config_path, &name).map_err(|e| e.to_string())?;
         let removed = drives.targets.remove(i);
+        drives.paused.remove(&name);
         if let Some(id) = removed.opts.drive_id {
             drives.removed.push(id);
         }
@@ -805,6 +843,59 @@ impl DriveManager for Manager {
         Ok(odrs_engine::filter::custom_rules(&Self::sync_list_text(&t)?))
     }
 
+    fn settings(&self) -> std::result::Result<Settings, String> {
+        let cfg = self.cfg.lock().unwrap();
+        Ok(Settings {
+            interval_secs: self.interval.load(Ordering::Relaxed),
+            skip_file: cfg.filters.skip_file.clone().unwrap_or_default(),
+            skip_dir: cfg.filters.skip_dir.clone().unwrap_or_default(),
+            skip_dotfiles: cfg.filters.skip_dotfiles.unwrap_or(false),
+        })
+    }
+
+    fn set_settings(&self, s: Settings) -> std::result::Result<(), String> {
+        if s.interval_secs < MIN_INTERVAL_SECS {
+            return Err(format!("the interval must be at least {MIN_INTERVAL_SECS} seconds"));
+        }
+        let path = &self.config_path;
+        let set = |key: &str, value: Option<String>| config::set_value(path, None, key, value).map_err(|e| e.to_string());
+        let list = |v: &str| Some(v.trim().to_owned()).filter(|v| !v.is_empty());
+        set("monitor_interval", Some(s.interval_secs.to_string()))?;
+        set("skip_file", list(&s.skip_file))?;
+        set("skip_dir", list(&s.skip_dir))?;
+        set("skip_dotfiles", s.skip_dotfiles.then(|| "true".to_owned()))?;
+        let cfg = Config::load(path).map_err(|e| format!("{e:#}"))?;
+        // A filter change is noticed by the next pass of each drive (see odrs_engine::selective).
+        let mut drives = self.drives.lock().unwrap();
+        for t in &mut drives.targets {
+            let section = cfg.drives.iter().find(|d| d.name == t.name);
+            t.opts.filters = cfg.sync_options(t.opts.sync_dir.clone(), section).filters;
+        }
+        drop(drives);
+        self.interval.store(s.interval_secs, Ordering::Relaxed);
+        *self.cfg.lock().unwrap() = cfg;
+        tracing::info!(interval = s.interval_secs, skip_file = %s.skip_file, skip_dir = %s.skip_dir, s.skip_dotfiles, "settings changed");
+        Ok(())
+    }
+
+    fn pause_drive(&self, name: String, paused: bool) -> std::result::Result<(), String> {
+        let mut drives = self.drives.lock().unwrap();
+        if !drives.targets.iter().any(|t| t.name == name) {
+            return Err(format!("no drive named \"{name}\""));
+        }
+        if paused {
+            drives.paused.insert(name.clone());
+        } else {
+            drives.paused.remove(&name);
+        }
+        let mut names: Vec<&String> = drives.paused.iter().collect();
+        names.sort();
+        let text: String = names.into_iter().map(|n| format!("{n}\n")).collect();
+        crate::write_private(&self.paused_file, text.as_bytes()).map_err(|e| format!("{}: {e}", self.paused_file.display()))?;
+        tracing::info!(drive = %name, paused, "drive paused or resumed");
+        Ok(())
+    }
+
     fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> std::result::Result<(), String> {
         let t = self.target(&name)?;
         let backup = PathBuf::from(backup);
@@ -839,7 +930,7 @@ impl DriveManager for Manager {
                 // Like the client for Windows: files at the top of the drive stay synced.
                 if !t.opts.filters.sync_root_files {
                     let section = (name != "main").then_some(name.as_str());
-                    config::set_value(&self.config_path, section, "sync_root_files", "true").map_err(|e| e.to_string())?;
+                    config::set_value(&self.config_path, section, "sync_root_files", "true".to_owned()).map_err(|e| e.to_string())?;
                 }
                 let tmp = file.with_extension("tmp");
                 std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &file)).map_err(|e| format!("{}: {e}", file.display()))?;

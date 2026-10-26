@@ -115,8 +115,14 @@ enumerates the drive again to bring in what is now included. Local copies of
 excluded items are kept (and never uploaded); identical local files are not
 downloaded again.
 
+The GUI's Settings window changes `monitor_interval` and the top-level
+filters (written to this file, applied without restarting the daemon), and
+whether the tray icon starts with the desktop session. Each drive can also be
+paused on its own from its card.
+
 Files: `refresh_token` (mode 0600), `items.sqlite3` (D client schema), `lock`,
-`upload_sessions/` (interrupted uploads), `filters/` (filters of the previous pass).
+`upload_sessions/` (interrupted uploads), `filters/` (filters of the previous pass),
+`events.json` (recent activity), `paused_drives`.
 Daemon log: `journalctl --user -u onedrive-rs`.
 
 ## Behaviour in short

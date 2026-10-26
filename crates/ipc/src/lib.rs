@@ -205,6 +205,19 @@ pub struct FolderChoice {
     pub expanded: bool,
 }
 
+/// Daemon-wide settings, from `Settings`, changed with `SetSettings`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct Settings {
+    /// Seconds between two passes over every drive (changes are also picked up
+    /// as they happen, locally and online).
+    pub interval_secs: u64,
+    /// File name patterns not synced, `|`-separated, besides the built-in ones.
+    pub skip_file: String,
+    /// Folder names (anywhere) or paths not synced, `|`-separated.
+    pub skip_dir: String,
+    pub skip_dotfiles: bool,
+}
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Drive management offered by the daemon. Answers do not wait for the sync
@@ -238,6 +251,11 @@ pub trait DriveManager: Send + Sync + 'static {
     /// the file) or the online one (`backup` goes). The version set aside goes
     /// to the desktop trash.
     fn resolve_conflict(&self, name: String, backup: String, keep_local: bool) -> std::result::Result<(), String>;
+    fn settings(&self) -> std::result::Result<Settings, String>;
+    /// Written to the config file and applied from the next pass.
+    fn set_settings(&self, settings: Settings) -> std::result::Result<(), String>;
+    /// Stop (or resume) syncing one drive; remembered across restarts.
+    fn pause_drive(&self, name: String, paused: bool) -> std::result::Result<(), String>;
 }
 
 /// Commands sent by clients to the daemon loop.
@@ -246,6 +264,8 @@ pub enum Command {
     SyncNow,
     Pause,
     Resume,
+    /// Drive states changed (a drive was paused): publish them, no pass needed.
+    Refresh,
 }
 
 /// Static facts about the daemon, set once at startup.
@@ -337,6 +357,21 @@ impl Service {
 
     async fn custom_rules(&self, name: String) -> zbus::fdo::Result<Vec<String>> {
         self.manager.custom_rules(name).map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn settings(&self) -> zbus::fdo::Result<Settings> {
+        self.manager.settings().map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn set_settings(&self, settings: Settings) -> zbus::fdo::Result<()> {
+        self.manager.set_settings(settings).map_err(zbus::fdo::Error::Failed)?;
+        self.send(Command::SyncNow)
+    }
+
+    /// Pause or resume one drive (the others keep syncing); resuming starts a pass.
+    async fn pause_drive(&self, name: String, paused: bool) -> zbus::fdo::Result<()> {
+        self.manager.pause_drive(name, paused).map_err(zbus::fdo::Error::Failed)?;
+        self.send(if paused { Command::Refresh } else { Command::SyncNow })
     }
 
     /// Settle a conflict (see [`DriveManager::resolve_conflict`]); a pass starts now.
@@ -525,6 +560,9 @@ pub trait OneDrive {
     fn custom_rules(&self, name: &str) -> zbus::Result<Vec<String>>;
     fn set_selection(&self, name: &str, choices: &[FolderChoice], delete_local: bool) -> zbus::Result<()>;
     fn resolve_conflict(&self, name: &str, backup: &str, keep_local: bool) -> zbus::Result<()>;
+    fn settings(&self) -> zbus::Result<Settings>;
+    fn set_settings(&self, settings: &Settings) -> zbus::Result<()>;
+    fn pause_drive(&self, name: &str, paused: bool) -> zbus::Result<()>;
     #[zbus(property)]
     fn verifications(&self) -> zbus::Result<Vec<VerifyStatus>>;
     #[zbus(property)]

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use odrs_gui::{
-    ActivityRow, ActivityWindow, DriveRow, FolderRow, FoldersWindow, MainWindow, ProblemRow, ProblemsWindow, ReportWindow, ResyncWindow, Status,
+    ActivityRow, ActivityWindow, DriveRow, FolderRow, FoldersWindow, MainWindow, ProblemRow, ProblemsWindow, ReportWindow, ResyncWindow, SettingsWindow, Status,
 };
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 
@@ -43,6 +43,16 @@ fn main() {
                     .map(StandardListViewItem::from)
                     .collect();
             w.set_items(ModelRc::from(Rc::new(VecModel::from(items))));
+            w.show().unwrap();
+            let weak = w.as_weak();
+            slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
+            slint::run_event_loop().unwrap();
+        }
+        "settings" => {
+            let w = SettingsWindow::new().unwrap();
+            w.set_skip_file("*.bak|*.iso".into());
+            w.set_skip_dir("node_modules".into());
+            w.set_autostart(true);
             w.show().unwrap();
             let weak = w.as_weak();
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
@@ -143,7 +153,7 @@ fn main() {
                 ..Default::default()
             };
             let rows = vec![
-                DriveRow { verify_state: "done".into(), verify_mins: 12, ..row("main", "OneDrive", "idle") },
+                DriveRow { verify_state: "done".into(), verify_mins: 12, ..row("main", "OneDrive", "paused") },
                 DriveRow {
                     verify_state: "running".into(),
                     verify_done: 4200,
@@ -169,12 +179,12 @@ fn main() {
             ];
             w.set_drives(ModelRc::from(Rc::new(VecModel::from(rows))));
             // Tall enough for every card.
-            w.window().set_size(slint::LogicalSize::new(560.0, 600.0));
+            w.window().set_size(slint::LogicalSize::new(660.0, 600.0));
             w.show().unwrap();
             let weak = w.as_weak();
             slint::Timer::single_shot(delay, move || snapshot(weak.unwrap().window(), out));
             slint::run_event_loop().unwrap();
         }
-        other => panic!("unknown window {other:?} (main, resync, report, folders, activity, problems)"),
+        other => panic!("unknown window {other:?} (main, resync, report, folders, activity, problems, settings)"),
     }
 }

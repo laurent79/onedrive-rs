@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ListView, ProgressIndicator, Spinner, StandardListView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, SpinBox, ListView, ProgressIndicator, Spinner, StandardListView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
 
 // Daemon-wide state, pushed from Rust once per second.
 export struct Status {
@@ -127,6 +127,9 @@ export global Logic {
     callback show-activity();
     // Conflicts and failed items of a drive (drive name).
     callback show-problems(string);
+    callback show-settings();
+    // Stop or resume syncing one drive (drive name, paused).
+    callback pause-drive(string, bool);
     callback start-daemon();
     callback reconnect();
     callback show-window();
@@ -270,6 +273,7 @@ export global Fmt {
         }
         if d.state == "error" { return d.last-error; }
         if d.state == "pending" { return @tr("Waiting for its first pass"); }
+        if d.state == "paused" { return @tr("Paused: not synchronised until you resume it"); }
         return @tr("Up to date, last sync {}", self.last-sync-label(d.last-sync-mins));
     }
 }
@@ -392,6 +396,11 @@ component DriveView inherits Rectangle {
                     clicked => { Logic.verify(drive.name); }
                 }
                 IconButton {
+                    icon: drive.state == "paused" ? @image-url("../icons/play.svg") : @image-url("../icons/pause.svg");
+                    tooltip: drive.state == "paused" ? @tr("Resume syncing this drive") : @tr("Pause this drive only");
+                    clicked => { Logic.pause-drive(drive.name, drive.state != "paused"); }
+                }
+                IconButton {
                     icon: @image-url("../icons/choose-folders.svg");
                     tooltip: @tr("Choose the folders to synchronise");
                     clicked => { Logic.choose-folders(drive.name); }
@@ -423,7 +432,7 @@ export component MainWindow inherits Window {
     in property <[DriveRow]> drives;
     title: "OneDrive";
     icon: @image-url("../icons/app.png");
-    preferred-width: 560px;
+    preferred-width: 660px;
     min-width: 420px;
     min-height: 440px;
 
@@ -474,6 +483,10 @@ export component MainWindow inherits Window {
             Button {
                 text: @tr("Activity");
                 clicked => { Logic.show-activity(); }
+            }
+            if status.state != "stopped": Button {
+                text: @tr("Settings");
+                clicked => { Logic.show-settings(); }
             }
             Rectangle { horizontal-stretch: 1; }
             if status.needs-login: Button {
@@ -949,6 +962,88 @@ export component ProblemsWindow inherits Window {
     }
 }
 
+// Daemon-wide settings, and the desktop session start.
+export component SettingsWindow inherits Window {
+    in-out property <int> interval-mins: 5;
+    in-out property <string> skip-file;
+    in-out property <string> skip-dir;
+    in-out property <bool> skip-dotfiles;
+    in-out property <bool> autostart;
+    in property <bool> busy;
+    in property <string> message;
+    callback save();
+    callback cancel();
+
+    title: @tr("Settings");
+    icon: @image-url("../icons/app.png");
+    preferred-width: 560px;
+    min-width: 440px;
+    // Wrapped text is measured on one line: keep the buttons in the window.
+    min-height: 520px;
+
+    VerticalBox {
+        Text { text: @tr("Synchronisation"); font-weight: 600; }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { text: @tr("Check every drive every"); vertical-alignment: center; }
+            SpinBox {
+                minimum: 1;
+                maximum: 1440;
+                value <=> root.interval-mins;
+                width: 110px;
+            }
+            Text { text: @tr("minutes"); vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text {
+            text: @tr("Changes are picked up as they happen, locally and online: this full check only catches what was missed.");
+            wrap: word-wrap;
+            font-size: 11px;
+            color: Palette.foreground.transparentize(30%);
+        }
+        Text { text: @tr("Not synchronised"); font-weight: 600; }
+        Text { text: @tr("Files (patterns separated by |, e.g. *.bak|*.iso)"); }
+        LineEdit { text <=> root.skip-file; placeholder-text: "*.bak|*.iso"; }
+        Text {
+            text: @tr("Always ignored as well: ~*, .~*, *.tmp, *.swp, *.partial");
+            font-size: 11px;
+            color: Palette.foreground.transparentize(30%);
+        }
+        Text { text: @tr("Folders (a name anywhere, or a path such as Documents/Old)"); }
+        LineEdit { text <=> root.skip-dir; placeholder-text: "node_modules|.cache"; }
+        CheckBox { text: @tr("Hidden files and folders (names starting with a dot)"); checked <=> root.skip-dotfiles; }
+        Text {
+            text: @tr("Items no longer synchronised keep their local copy; newly included ones are downloaded.");
+            wrap: word-wrap;
+            font-size: 11px;
+            color: Palette.foreground.transparentize(30%);
+        }
+        Text { text: @tr("Desktop"); font-weight: 600; }
+        CheckBox { text: @tr("Show the OneDrive icon when the session starts"); checked <=> root.autostart; }
+        if root.message != "": Text {
+            text: root.message;
+            color: #c62828;
+            wrap: word-wrap;
+        }
+        Rectangle { vertical-stretch: 1; }
+        HorizontalBox {
+            padding: 0;
+            if root.busy: Spinner { indeterminate: true; width: 18px; height: 18px; }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.cancel(); }
+            }
+            Button {
+                text: @tr("Save");
+                primary: true;
+                enabled: !root.busy;
+                clicked => { root.save(); }
+            }
+        }
+    }
+}
+
 // What the daemon did recently: files received, sent, deleted, conflicts.
 export component ActivityWindow inherits Window {
     in property <[ActivityRow]> rows;
@@ -1045,6 +1140,7 @@ export component Tray inherits SystemTrayIcon {
         MenuItem { title: Fmt.state-label(status.state); enabled: false; }
         MenuItem { title: @tr("Show window"); activated => { Logic.show-window(); } }
         MenuItem { title: @tr("Recent activity"); activated => { Logic.show-activity(); } }
+        MenuItem { title: @tr("Settings"); enabled: status.state != "stopped"; activated => { Logic.show-settings(); } }
         if status.needs-login: MenuItem { title: @tr("Sign in again"); activated => { Logic.reconnect(); } }
         MenuSeparator { }
         MenuItem {
